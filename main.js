@@ -576,32 +576,22 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     let current = "";
     for (const part of parts) {
       current = current ? `${current}/${part}` : part;
-      const existing = this.app.vault.getAbstractFileByPath(current);
-      if (existing instanceof import_obsidian.TFile) return { ok: false, reason: `${current}: path is a file` };
-      if (existing) continue;
+      const indexed = this.app.vault.getAbstractFileByPath(current);
+      if (indexed instanceof import_obsidian.TFile) return { ok: false, reason: `${current}: path is a file` };
+      const stat = await this.app.vault.adapter.stat(current);
+      if ((stat == null ? void 0 : stat.type) === "file") return { ok: false, reason: `${current}: path is a file` };
+      if ((stat == null ? void 0 : stat.type) === "folder") continue;
       try {
-        await this.app.vault.createFolder(current);
+        await this.app.vault.adapter.mkdir(current);
       } catch (error) {
-        const message = safeError(error).toLowerCase();
-        for (let attempt = 0; attempt < 4; attempt++) {
-          const raced2 = this.app.vault.getAbstractFileByPath(current);
-          if (raced2 instanceof import_obsidian.TFile) return { ok: false, reason: `${current}: path is a file` };
-          if (raced2) break;
-          if (!message.includes("already exists")) throw error;
-          await waitMs(50 * (attempt + 1));
-          try {
-            await this.app.vault.createFolder(current);
-            break;
-          } catch (retryError) {
-            if (!safeError(retryError).toLowerCase().includes("already exists")) throw retryError;
-          }
-        }
-        const raced = this.app.vault.getAbstractFileByPath(current);
-        if (raced instanceof import_obsidian.TFile) return { ok: false, reason: `${current}: path is a file` };
-        if (raced) continue;
-        if (message.includes("already exists")) continue;
-        throw error;
+        const after = await this.app.vault.adapter.stat(current);
+        if ((after == null ? void 0 : after.type) === "folder") continue;
+        if ((after == null ? void 0 : after.type) === "file") return { ok: false, reason: `${current}: path is a file` };
+        throw new Error(`${current}: cannot create folder: ${safeError(error)}`);
       }
+      const created = await this.app.vault.adapter.stat(current);
+      if ((created == null ? void 0 : created.type) === "file") return { ok: false, reason: `${current}: path is a file` };
+      if (!created || created.type !== "folder") throw new Error(`${current}: folder was not created`);
     }
     return { ok: true };
   }
