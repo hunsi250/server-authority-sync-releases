@@ -542,9 +542,16 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     const suffix = offline ? "offline" : this.syncState.conflicts.length ? "conflicts" : this.syncState.pendingSubmissions.length ? "pending" : "clean";
     if (this.statusBar) this.statusBar.setText(`Authority: ${suffix} \xB7 ${pairingStatusLabel(this.pairingStatus)}`);
   }
+  pluginRoot() {
+    return `${this.app.vault.configDir || ".obsidian"}/plugins/server-authority-sync`;
+  }
+  isLocalPluginPath(path) {
+    const root = this.pluginRoot();
+    return path === root || path.startsWith(root + "/") || path === CACHE_ROOT || path.startsWith(CACHE_ROOT + "/");
+  }
   markVaultChanged(file) {
     if (this.internalWrites.delete(file.path)) return;
-    if (!file.path.startsWith(CACHE_ROOT + "/")) this.updateStatus();
+    if (!this.isLocalPluginPath(file.path)) this.updateStatus();
   }
   async saveSettings() {
     this.settings = mergeSettings(this.settings);
@@ -559,7 +566,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     return new RequestUrlTransport(this.settings, this.session, this.enrollment);
   }
   included(file) {
-    return !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/plugins/server-authority-sync/`) && !file.path.startsWith(".obsidian/workspace") && !file.path.startsWith(".obsidian/cache/") && !file.path.startsWith(CACHE_ROOT + "/") && !file.path.endsWith("/.authority.sqlite3") && file.path !== ".authority.sqlite3";
+    return !this.isLocalPluginPath(file.path) && !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/workspace`) && !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/cache/`) && !file.path.endsWith("/.authority.sqlite3") && file.path !== ".authority.sqlite3";
   }
   async localHashes() {
     const result = {};
@@ -729,8 +736,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     try {
       const bytes = new Uint8Array(await this.app.vault.readBinary(existing));
       const localHash = await this.hash(bytes.buffer);
-      const pluginRoot = `${this.app.vault.configDir || ".obsidian"}/plugins/server-authority-sync`;
-      const cachePath = `${pluginRoot}/overwrites/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
+      const cachePath = `${this.pluginRoot()}/overwrites/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
       const folderResult = await this.ensureFolder(cachePath);
       if (!folderResult.ok) {
         console.warn(`[Server Authority Sync] overwrite backup skipped: ${folderResult.reason}`);
@@ -747,8 +753,13 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     let cachePath = "";
     if (decision.serverHash) {
       const file = await transport.readFile(decision.path);
-      cachePath = `${CACHE_ROOT}/conflicts/${encodeURIComponent(decision.path)}-${encodeURIComponent(revision)}.bin`;
-      await this.writeFile(cachePath, base64ToBytes(file.content_base64));
+      const candidate = `${this.pluginRoot()}/conflicts/${encodeURIComponent(decision.path)}-${encodeURIComponent(revision)}.bin`;
+      try {
+        const result = await this.writeFile(candidate, base64ToBytes(file.content_base64));
+        if (result.status !== "conflict") cachePath = candidate;
+      } catch (error) {
+        console.warn(`[Server Authority Sync] conflict backup skipped: ${safeError(error)}`);
+      }
     }
     const record = { conflictId: crypto.randomUUID(), path: decision.path, paths: [decision.path], baseHash: decision.baseHash, localHash: decision.localHash, serverHash: decision.serverHash, serverRevisionId: revision, serverCachePath: cachePath, createdAt: (/* @__PURE__ */ new Date()).toISOString(), reason: (_a = decision.reason) != null ? _a : "same-path concurrent change", scope: "same-path" };
     this.syncState.conflicts.push(record);
