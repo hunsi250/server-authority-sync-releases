@@ -695,7 +695,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
             await this.cacheConflict(transport, manifest.revision_id, decision);
           }
         } catch (error) {
-          throw error;
+          throw new Error(`${decision.path}: ${safeError(error)}`);
         }
         await this.saveSync();
       }
@@ -735,8 +735,9 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     const bytes = new Uint8Array(await this.app.vault.readBinary(existing));
     const localHash = await this.hash(bytes.buffer);
     const cachePath = `${CACHE_ROOT}/server-overwrites/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
-    const result = await this.writeFile(cachePath, bytes, "cache");
-    if (result.status === "conflict") throw new Error(`Cannot cache local file before server overwrite: ${path}`);
+    const folderResult = await this.ensureFolder(cachePath);
+    if (!folderResult.ok) throw new Error(`Cannot prepare overwrite cache: ${folderResult.reason}`);
+    await this.app.vault.adapter.writeBinary(cachePath, bytes.buffer);
   }
   async cacheConflict(transport, revision, decision) {
     var _a;
