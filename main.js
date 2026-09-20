@@ -726,12 +726,20 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   async cacheLocalBeforeOverwrite(path, revision) {
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (!(existing instanceof import_obsidian.TFile)) return;
-    const bytes = new Uint8Array(await this.app.vault.readBinary(existing));
-    const localHash = await this.hash(bytes.buffer);
-    const cachePath = `${CACHE_ROOT}/server-overwrites/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
-    const folderResult = await this.ensureFolder(cachePath);
-    if (!folderResult.ok) throw new Error(`Cannot prepare overwrite cache: ${folderResult.reason}`);
-    await this.app.vault.adapter.writeBinary(cachePath, bytes.buffer);
+    try {
+      const bytes = new Uint8Array(await this.app.vault.readBinary(existing));
+      const localHash = await this.hash(bytes.buffer);
+      const pluginRoot = `${this.app.vault.configDir || ".obsidian"}/plugins/server-authority-sync`;
+      const cachePath = `${pluginRoot}/overwrites/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
+      const folderResult = await this.ensureFolder(cachePath);
+      if (!folderResult.ok) {
+        console.warn(`[Server Authority Sync] overwrite backup skipped: ${folderResult.reason}`);
+        return;
+      }
+      await this.app.vault.adapter.writeBinary(cachePath, bytes.buffer);
+    } catch (error) {
+      console.warn(`[Server Authority Sync] overwrite backup skipped: ${safeError(error)}`);
+    }
   }
   async cacheConflict(transport, revision, decision) {
     var _a;
