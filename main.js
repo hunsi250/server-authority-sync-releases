@@ -648,6 +648,10 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
             const racedHash = await this.hash(await this.app.vault.readBinary(raced));
             if (racedHash === incomingHash) return { status: "skipped" };
           }
+          if (message.includes("already exists")) {
+            await this.app.vault.adapter.writeBinary(path, buffer);
+            return { status: "written" };
+          }
           throw error;
         }
       }
