@@ -582,15 +582,24 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       try {
         await this.app.vault.createFolder(current);
       } catch (error) {
-        for (let attempt = 0; attempt < 3; attempt++) {
+        const message = safeError(error).toLowerCase();
+        for (let attempt = 0; attempt < 4; attempt++) {
           const raced2 = this.app.vault.getAbstractFileByPath(current);
           if (raced2 instanceof import_obsidian.TFile) return { ok: false, reason: `${current}: path is a file` };
           if (raced2) break;
-          await waitMs(25 * (attempt + 1));
+          if (!message.includes("already exists")) throw error;
+          await waitMs(50 * (attempt + 1));
+          try {
+            await this.app.vault.createFolder(current);
+            break;
+          } catch (retryError) {
+            if (!safeError(retryError).toLowerCase().includes("already exists")) throw retryError;
+          }
         }
         const raced = this.app.vault.getAbstractFileByPath(current);
         if (raced instanceof import_obsidian.TFile) return { ok: false, reason: `${current}: path is a file` };
         if (raced) continue;
+        if (message.includes("already exists")) continue;
         throw error;
       }
     }
@@ -614,16 +623,31 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
         try {
           await this.app.vault.createBinary(path, buffer);
         } catch (error) {
-          let raced = this.app.vault.getAbstractFileByPath(path);
-          for (let attempt = 0; attempt < 3 && !raced; attempt++) {
-            await waitMs(25 * (attempt + 1));
-            raced = this.app.vault.getAbstractFileByPath(path);
+          const message = safeError(error).toLowerCase();
+          for (let attempt = 0; attempt < 4; attempt++) {
+            let raced2 = this.app.vault.getAbstractFileByPath(path);
+            if (!raced2) {
+              await waitMs(50 * (attempt + 1));
+              raced2 = this.app.vault.getAbstractFileByPath(path);
+            }
+            const racedKind = raced2 instanceof import_obsidian.TFile ? "file" : raced2 ? "folder" : "none";
+            const racedHash = raced2 instanceof import_obsidian.TFile ? await this.hash(await this.app.vault.readBinary(raced2)) : null;
+            const reconciliation = reconcileCreateRace({ existing: racedKind, existingHash: racedHash, incomingHash });
+            if (reconciliation.action === "reconciled") return { status: "skipped" };
+            if (reconciliation.action === "conflict") return { status: "conflict", reason: reconciliation.reason };
+            if (!message.includes("already exists")) throw error;
+            try {
+              await this.app.vault.createBinary(path, buffer);
+              return { status: "written" };
+            } catch (retryError) {
+              if (!safeError(retryError).toLowerCase().includes("already exists")) throw retryError;
+            }
           }
-          const racedKind = raced instanceof import_obsidian.TFile ? "file" : raced ? "folder" : "none";
-          const racedHash = raced instanceof import_obsidian.TFile ? await this.hash(await this.app.vault.readBinary(raced)) : null;
-          const reconciliation = reconcileCreateRace({ existing: racedKind, existingHash: racedHash, incomingHash });
-          if (reconciliation.action === "reconciled") return { status: "skipped" };
-          if (reconciliation.action === "conflict") return { status: "conflict", reason: reconciliation.reason };
+          const raced = this.app.vault.getAbstractFileByPath(path);
+          if (raced instanceof import_obsidian.TFile) {
+            const racedHash = await this.hash(await this.app.vault.readBinary(raced));
+            if (racedHash === incomingHash) return { status: "skipped" };
+          }
           throw error;
         }
       }
