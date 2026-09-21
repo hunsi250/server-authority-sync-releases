@@ -92,6 +92,12 @@ function normalizeSyncState(value) {
   }
   return { version: SYNC_STATE_VERSION, serverRevision: typeof input.serverRevision === "string" ? input.serverRevision : null, files, pendingSubmissions: Array.isArray(input.pendingSubmissions) ? input.pendingSubmissions : [], conflicts: Array.isArray(input.conflicts) ? input.conflicts : [] };
 }
+function isLocalClean(state, local) {
+  return [.../* @__PURE__ */ new Set([...Object.keys(local), ...Object.keys(state.files)])].every((path) => {
+    var _a, _b, _c;
+    return ((_a = local[path]) != null ? _a : null) === ((_c = (_b = state.files[path]) == null ? void 0 : _b.baseHash) != null ? _c : null);
+  });
+}
 function planSync(state, local, server, localKinds = {}, serverKinds = {}) {
   const paths = /* @__PURE__ */ new Set([...Object.keys(state.files), ...Object.keys(local), ...Object.keys(server), ...Object.keys(localKinds), ...Object.keys(serverKinds)]);
   const localAdded = Object.keys(local).filter((path) => !state.files[path]);
@@ -142,16 +148,18 @@ function validSession(value) {
 function shouldRenewSession(session, deviceToken) {
   return typeof deviceToken === "string" && deviceToken.length > 0 && !validSession(session);
 }
-async function pairDevice(transport, identity, save, pending, wait = () => new Promise((resolve) => setTimeout(resolve, 2e3)), active = () => true) {
+async function pairDevice(transport, identity, save, pending, wait = () => new Promise((resolve) => setTimeout(resolve, 2e3)), active = () => true, creating = () => {
+}) {
   validateServerFingerprint(identity.server_fingerprint);
   const health = await transport.health();
   const info = await transport.serverInfo();
   if (!health.ok || health.protocol_version !== "1" || identity.protocol_version !== "1" || Object.entries(identity).some(([k, v]) => info[k] !== v)) throw new Error("Server identity does not match settings.");
   if (!active()) throw new Error("Pairing cancelled.");
+  await creating();
   const enrollment = await transport.createEnrollment(identity);
   const expires = Math.min(Date.parse(enrollment.expires_at), Date.now() + 3e5);
   if (!enrollment.request_id || !enrollment.poll_secret || !Number.isFinite(expires)) throw new Error("Invalid enrollment response.");
-  pending(enrollment.request_id);
+  await pending(enrollment.request_id);
   while (active() && Date.now() < expires) {
     const result = await transport.pollEnrollment(enrollment.request_id, identity, enrollment.poll_secret);
     if (!active() || Date.now() >= expires) throw new Error("Pairing expired or was cancelled.");
@@ -166,7 +174,7 @@ async function pairDevice(transport, identity, save, pending, wait = () => new P
   }
   throw new Error("Pairing expired or was cancelled. Test and pair again.");
 }
-var PAIRING_KINDS = /* @__PURE__ */ new Set(["not-paired", "testing", "waiting", "approved", "ready", "expired", "settings-changed", "server-rejected", "connection-failed", "save-failed"]);
+var PAIRING_KINDS = /* @__PURE__ */ new Set(["not-paired", "testing", "creating", "saving", "waiting", "approved", "ready", "expired", "settings-changed", "server-rejected", "connection-failed", "save-failed"]);
 function normalizePairingStatus(value) {
   if (!value || typeof value !== "object") return { kind: "not-paired" };
   const input = value;
@@ -174,7 +182,7 @@ function normalizePairingStatus(value) {
   return { kind, ...typeof input.reason === "string" && input.reason ? { reason: input.reason.slice(0, 120) } : {} };
 }
 function pairingStatusLabel(status) {
-  const labels = { "not-paired": "Not paired", testing: "Checking server identity", waiting: "Waiting for administrator approval", approved: "Pairing approved; saving credentials", ready: "Paired and ready", expired: "Pairing expired", "settings-changed": "Pairing stopped: settings changed", "server-rejected": "Pairing failed: server rejected the request", "connection-failed": "Pairing failed: connection failure", "save-failed": "Pairing failed: credentials could not be saved" };
+  const labels = { "not-paired": "Not paired", testing: "Checking server identity", creating: "Creating pairing request", saving: "Saving pairing credentials", waiting: "Waiting for administrator approval", approved: "Pairing approved; saving credentials", ready: "Paired and ready", expired: "Pairing expired", "settings-changed": "Pairing stopped: settings changed", "server-rejected": "Pairing failed: server rejected the request", "connection-failed": "Pairing failed: connection failure", "save-failed": "Pairing failed: credentials could not be saved" };
   return labels[status.kind] + (status.reason ? ` (${status.reason})` : "");
 }
 function transitionPairingStatus(status, event) {
@@ -188,6 +196,7 @@ function transitionPairingStatus(status, event) {
   return { kind: event };
 }
 function planLocalWrite(input) {
+  if (input.expectedLocalHash !== void 0 && input.localHash !== input.expectedLocalHash) return { action: "abort", reason: "local file changed after preflight" };
   if (input.existing === "folder") return { action: "conflict", reason: "path is a folder" };
   if (input.existing === "file") {
     if (input.localHash === input.incomingHash) return { action: "skip" };
@@ -267,7 +276,7 @@ function applyActionRowLayout(controlEl) {
 var PROTOCOL_VERSION = "1";
 var DEFAULT_API_PREFIX = "/api/v1";
 var CACHE_ROOT = ".obsidian/server-authority-sync";
-var DEFAULT_SETTINGS = { serverUrl: "", apiPrefix: DEFAULT_API_PREFIX, vaultId: "default", serverFingerprint: "", autoCheckIntervalMinutes: 30, syncPolicy: "pull-when-clean", aiProvider: { provider: "", model: "", endpoint: "" } };
+var DEFAULT_SETTINGS = { serverUrl: "", apiPrefix: DEFAULT_API_PREFIX, vaultId: "default", serverFingerprint: "", autoCheckIntervalMinutes: 30, syncPolicy: "manual", aiProvider: { provider: "", model: "", endpoint: "" } };
 function mergeSettings(input) {
   var _a;
   return { ...DEFAULT_SETTINGS, ...input != null ? input : {}, aiProvider: { ...DEFAULT_SETTINGS.aiProvider, ...(_a = input == null ? void 0 : input.aiProvider) != null ? _a : {} } };
@@ -360,16 +369,29 @@ function userFacingServerError(status, payload) {
 function safeError(error) {
   return error instanceof Error ? error.message.slice(0, 160) : "server request failed";
 }
+var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted"]);
+function requestStage(path) {
+  if (path === "/health") return "health";
+  if (path === "/server-info") return "server-info";
+  if (path === "/enrollments") return "create-enrollment";
+  if (path.endsWith("/poll")) return "poll";
+  if (path.endsWith("/manifest")) return "manifest";
+  if (path.includes("/files/")) return "file";
+  if (path === "/submissions") return "submit";
+  return path === "/enrollments/session" ? "session" : path === "/submissions/list" ? "submissions" : "setup";
+}
 function waitMs(ms) {
   return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 }
 var RequestUrlTransport = class {
-  constructor(settings, session, enrollment, deviceToken = "", saveSession) {
+  constructor(settings, session, enrollment, deviceToken = "", saveSession, recordDiagnostic, credentialsSaved) {
     this.settings = settings;
     this.session = session;
     this.enrollment = enrollment;
     this.deviceToken = deviceToken;
     this.saveSession = saveSession;
+    this.recordDiagnostic = recordDiagnostic;
+    this.credentialsSaved = credentialsSaved;
     __publicField(this, "renewal");
   }
   renewSession() {
@@ -392,7 +414,22 @@ var RequestUrlTransport = class {
     await ((_a = this.saveSession) == null ? void 0 : _a.call(this, renewed));
   }
   async request(method, path, body, authenticated = false, retried = false) {
-    var _a;
+    if (this.credentialsSaved && !await this.credentialsSaved) throw new Error("Credential storage failed. Test and pair again.");
+    const stage = requestStage(path);
+    const failure = (message, status, payload2, headers) => {
+      var _a, _b, _c;
+      let code, requestId;
+      try {
+        const candidate = (_a = payload2 == null ? void 0 : payload2.error) == null ? void 0 : _a.code;
+        if (typeof candidate === "string" && SAFE_CODES.has(candidate)) code = candidate;
+        const id = (_b = headers == null ? void 0 : headers["x-request-id"]) != null ? _b : headers == null ? void 0 : headers["X-Request-Id"];
+        if (id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) requestId = id;
+      } catch (e) {
+      }
+      const diagnostic = { stage, status, code, requestId, retryCount: retried ? 1 : 0, retryable: status === void 0 || status === 408 || status === 429 || status >= 500 };
+      (_c = this.recordDiagnostic) == null ? void 0 : _c.call(this, diagnostic);
+      return Object.assign(new Error(message), { status, code, diagnostic });
+    };
     if (authenticated) {
       if (this.enrollment) {
         if (!this.enrollment.request_id || !this.enrollment.poll_secret || !(Date.parse(this.enrollment.expires_at) > Date.now())) throw new Error("Enrollment session expired. Test and pair again.");
@@ -417,32 +454,36 @@ var RequestUrlTransport = class {
     try {
       response = await (0, import_obsidian.requestUrl)(params);
     } catch (e) {
-      throw new Error("Server connection failed");
+      throw failure("Server connection failed");
+    }
+    let payload;
+    try {
+      payload = response.json;
+    } catch (e) {
+      throw failure("Invalid server response", response.status);
     }
     if (authenticated && response.status === 401) {
       this.session = void 0;
       if (this.enrollment) {
         this.enrollment.expires_at = "";
-        throw new Error("Session expired or revoked. Test and pair again.");
+        throw failure("Session expired or revoked. Test and pair again.", response.status, payload, response.headers);
       }
       if (!retried && this.deviceToken) {
         await this.renewSession();
         return this.request(method, path, body, authenticated, true);
       }
-      throw new Error("Session expired or revoked. Test and pair again.");
+      throw failure("Session expired or revoked. Test and pair again.", response.status, payload, response.headers);
     }
     if (response.status < 200 || response.status >= 300) {
-      const error = new Error(userFacingServerError(response.status, response.json));
-      error.status = response.status;
-      const payload = response.json;
-      if (((_a = payload == null ? void 0 : payload.error) == null ? void 0 : _a.code) && typeof payload.error.code === "string") error.code = payload.error.code;
-      throw error;
+      let message;
+      try {
+        message = userFacingServerError(response.status, payload);
+      } catch (e) {
+        message = userFacingServerError(response.status, void 0);
+      }
+      throw failure(message, response.status, payload, response.headers);
     }
-    try {
-      return response.json;
-    } catch (e) {
-      throw new Error("Invalid server response");
-    }
+    return payload;
   }
   createEnrollment(identity) {
     return this.request("POST", "/enrollments", identity);
@@ -475,6 +516,12 @@ var RequestUrlTransport = class {
 var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
+    __publicField(this, "errors", []);
+    __publicField(this, "credentialBinding");
+    __publicField(this, "credentialsSaved");
+    __publicField(this, "recordDiagnostic", (diagnostic) => {
+      this.errors = [...this.errors.slice(-19), diagnostic];
+    });
     __publicField(this, "pairing", false);
     __publicField(this, "syncing", false);
     __publicField(this, "unloaded", false);
@@ -487,6 +534,33 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "syncState", emptySyncState());
     __publicField(this, "statusBar");
     __publicField(this, "internalWrites", /* @__PURE__ */ new Set());
+    __publicField(this, "changeVersions", /* @__PURE__ */ new Map());
+  }
+  binding() {
+    return JSON.stringify([this.settings.serverUrl, this.settings.apiPrefix, this.settings.vaultId, this.settings.serverFingerprint]);
+  }
+  clearCredentials() {
+    this.deviceToken = "";
+    this.session = void 0;
+    this.enrollment = void 0;
+    this.credentialBinding = void 0;
+  }
+  diagnosticsText() {
+    return JSON.stringify({ errors: this.errors }, null, 2);
+  }
+  async copyDiagnostics() {
+    try {
+      await globalThis.navigator.clipboard.writeText(this.diagnosticsText());
+      new import_obsidian.Notice("Diagnostics copied.");
+    } catch (e) {
+      new ConfigurationExportModal(this.app, this.diagnosticsText()).open();
+    }
+  }
+  async resetPairingState() {
+    this.clearCredentials();
+    this.pairingStatus = { kind: "not-paired" };
+    await this.saveSettings();
+    this.updateStatus();
   }
   async onload() {
     const data = await this.loadData();
@@ -496,10 +570,19 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.enrollment = data == null ? void 0 : data.enrollment;
     this.pairingStatus = normalizePairingStatus(data == null ? void 0 : data.pairingStatus);
     if (this.session && this.pairingStatus.kind === "not-paired") this.pairingStatus = { kind: "ready" };
+    this.credentialBinding = data == null ? void 0 : data.credentialBinding;
     this.syncState = normalizeSyncState(data == null ? void 0 : data.sync);
+    if (!this.credentialBinding || this.credentialBinding !== this.binding()) {
+      this.clearCredentials();
+      this.pairingStatus = { kind: "not-paired" };
+      this.settings.syncPolicy = "manual";
+      await this.saveSettings();
+    }
     this.statusBar = this.addStatusBarItem();
     this.updateStatus();
     this.addSettingTab(new AuthoritySettingTab(this.app, this));
+    this.addRibbonIcon("refresh-cw", "Sync with server", () => void this.syncWithServer()).setAttr("aria-label", "Sync with server");
+    this.addRibbonIcon("upload", "Submit pending changes", () => void this.submitPendingChanges()).setAttr("aria-label", "Submit pending changes");
     this.addCommand({ id: "sync-with-server", name: "Sync with server", callback: () => void this.syncWithServer() });
     this.addCommand({ id: "submit-pending-changes", name: "Submit pending changes", callback: () => void this.submitPendingChanges() });
     this.addCommand({ id: "open-conflicts", name: "Open conflicts", callback: () => void this.openConflicts() });
@@ -514,7 +597,9 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.registerEvent(this.app.vault.on("delete", (file) => this.markVaultChanged(file)));
     this.registerEvent(this.app.vault.on("rename", (file) => this.markVaultChanged(file)));
     this.registerInterval(window.setInterval(() => {
-      if (this.settings.autoCheckIntervalMinutes > 0) void this.checkServerVersion(true);
+      if (this.settings.autoCheckIntervalMinutes > 0) void this.checkServerVersion(true).then((connected) => {
+        if (connected) return this.autoPull();
+      }).catch(() => this.updateStatus(true));
     }, Math.max(1, this.settings.autoCheckIntervalMinutes) * 6e4));
   }
   onunload() {
@@ -526,6 +611,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       return;
     }
     this.pairing = true;
+    this.clearCredentials();
     const snapshot = { ...this.settings };
     const active = () => !this.unloaded && ["serverUrl", "apiPrefix", "vaultId", "serverFingerprint"].every((key) => this.settings[key] === snapshot[key]);
     const setPairing = async (status) => {
@@ -535,32 +621,31 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     };
     try {
       await setPairing(transitionPairingStatus(this.pairingStatus, "testing"));
-      await pairDevice(new RequestUrlTransport(snapshot), { protocol_version: "1", vault_id: snapshot.vaultId, server_fingerprint: snapshot.serverFingerprint }, async (credentials, enrollment) => {
+      await pairDevice(new RequestUrlTransport(snapshot, void 0, void 0, "", void 0, this.recordDiagnostic), { protocol_version: "1", vault_id: snapshot.vaultId, server_fingerprint: snapshot.serverFingerprint }, async (credentials, enrollment) => {
         await setPairing(transitionPairingStatus(this.pairingStatus, "approved"));
-        const previous = this.deviceToken;
-        const previousSession = this.session;
-        const previousEnrollment = this.enrollment;
+        await setPairing({ kind: "saving" });
         this.deviceToken = credentials.device_token;
         this.session = { ticket: credentials.ticket, expires_at: credentials.expires_at };
         this.enrollment = enrollment;
+        this.credentialBinding = this.binding();
         try {
           await this.saveSettings();
         } catch (e) {
-          this.deviceToken = previous;
-          this.session = previousSession;
-          this.enrollment = previousEnrollment;
-          this.pairingStatus = transitionPairingStatus(this.pairingStatus, "save-failed");
-          await this.saveSettings().catch(() => void 0);
+          this.clearCredentials();
+          this.recordDiagnostic({ stage: "save", retryCount: 0, retryable: false });
           throw new Error("Unable to save pairing.");
         }
-      }, () => {
+      }, async () => {
         this.pairingStatus = transitionPairingStatus(this.pairingStatus, "waiting");
-        void this.saveSettings();
+        await this.saveSettings();
         this.updateStatus();
         new import_obsidian.Notice(pairingStatusLabel(this.pairingStatus), 15e3);
-      }, void 0, active);
+      }, void 0, active, async () => {
+        await setPairing({ kind: "creating" });
+      });
       await setPairing(transitionPairingStatus(this.pairingStatus, "saved"));
     } catch (error) {
+      this.clearCredentials();
       const message = safeError(error).toLowerCase();
       const event = !active() ? "settings-changed" : message.includes("connection") ? "connection-failed" : message.includes("reject") || message.includes("identity") ? "server-rejected" : message.includes("expired") || message.includes("cancel") ? "expired" : message.includes("save") ? "save-failed" : "server-rejected";
       this.pairingStatus = transitionPairingStatus(this.pairingStatus, event);
@@ -583,23 +668,35 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     return path === root || path.startsWith(root + "/") || path === CACHE_ROOT || path.startsWith(CACHE_ROOT + "/");
   }
   markVaultChanged(file) {
+    var _a;
+    this.changeVersions.set(file.path, ((_a = this.changeVersions.get(file.path)) != null ? _a : 0) + 1);
     if (this.internalWrites.delete(file.path)) return;
     if (!this.isLocalPluginPath(file.path)) this.updateStatus();
   }
   async saveSettings() {
     this.settings = mergeSettings(this.settings);
-    await this.saveData({ settings: this.settings, device_token: this.deviceToken, session: this.session, enrollment: this.enrollment, pairingStatus: this.pairingStatus, sync: this.syncState });
+    if (this.credentialBinding && this.credentialBinding !== this.binding()) {
+      this.clearCredentials();
+      this.pairingStatus = { kind: "settings-changed" };
+    }
+    await this.saveData({ settings: this.settings, credentialBinding: this.credentialBinding, device_token: this.deviceToken, session: this.session, enrollment: this.enrollment, pairingStatus: this.pairingStatus, sync: this.syncState });
+    this.credentialsSaved = void 0;
   }
   async saveSync() {
-    await this.saveData({ settings: this.settings, device_token: this.deviceToken, session: this.session, enrollment: this.enrollment, pairingStatus: this.pairingStatus, sync: this.syncState });
+    await this.saveData({ settings: this.settings, credentialBinding: this.credentialBinding, device_token: this.deviceToken, session: this.session, enrollment: this.enrollment, pairingStatus: this.pairingStatus, sync: this.syncState });
     this.updateStatus();
   }
   transport() {
+    if (this.credentialBinding && this.credentialBinding !== this.binding()) {
+      this.clearCredentials();
+      this.pairingStatus = { kind: "settings-changed" };
+      this.credentialsSaved = this.saveSettings().then(() => true, () => false);
+    }
     if (!this.settings.serverUrl) throw new Error("Set a server URL first");
     return new RequestUrlTransport(this.settings, this.session, this.enrollment, this.deviceToken, async (session) => {
       this.session = session;
       if (typeof this.saveData === "function") await this.saveSettings();
-    });
+    }, this.recordDiagnostic, this.credentialsSaved);
   }
   included(file) {
     return !this.isLocalPluginPath(file.path) && !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/workspace`) && !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/cache/`) && !file.path.endsWith("/.authority.sqlite3") && file.path !== ".authority.sqlite3";
@@ -638,7 +735,9 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     }
     return { ok: true };
   }
-  async writeFile(path, bytes, planner = "pull") {
+  async writeFile(path, bytes, planner = "pull", expectedLocalHash) {
+    var _a, _b;
+    const changeVersion = (_a = this.changeVersions.get(path)) != null ? _a : 0;
     const folders = await this.ensureFolder(path);
     if (!folders.ok) return { status: "conflict", reason: folders.reason };
     const existing = this.app.vault.getAbstractFileByPath(path);
@@ -646,13 +745,16 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     const incomingHash = await this.hash(buffer);
     const existingKind = existing instanceof import_obsidian.TFile ? "file" : existing ? "folder" : "none";
     const localHash = existing instanceof import_obsidian.TFile ? await this.hash(await this.app.vault.readBinary(existing)) : null;
-    const decision = planLocalWrite({ planner, existing: existingKind, localHash, incomingHash });
+    const decision = planLocalWrite({ planner, existing: existingKind, localHash, incomingHash, expectedLocalHash });
+    if (decision.action === "abort") throw new Error(decision.reason);
     if (decision.action === "conflict") return { status: "conflict", reason: decision.reason };
     if (decision.action === "skip") return { status: "skipped" };
     this.internalWrites.add(path);
     try {
-      if (decision.action === "modify" && existing instanceof import_obsidian.TFile) await this.app.vault.modifyBinary(existing, buffer);
-      else {
+      if (decision.action === "modify" && existing instanceof import_obsidian.TFile) {
+        if (expectedLocalHash !== void 0 && ((_b = this.changeVersions.get(path)) != null ? _b : 0) !== changeVersion) throw new Error("Local file changed during automatic pull");
+        await this.app.vault.modifyBinary(existing, buffer);
+      } else {
         try {
           await this.app.vault.createBinary(path, buffer);
         } catch (error) {
@@ -696,8 +798,15 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       globalThis.setTimeout(() => this.internalWrites.delete(path), 1e3);
     }
   }
-  async syncWithServer() {
-    var _a, _b;
+  async autoPull() {
+    const eligible = () => this.settings.syncPolicy === "pull-when-clean" && this.pairingStatus.kind === "ready" && !this.pairing && !this.syncing && !this.submitting && !this.unloaded && !this.syncState.pendingSubmissions.length && !this.syncState.conflicts.length;
+    if (!eligible()) return;
+    const local = await this.localHashes();
+    if (!isLocalClean(this.syncState, local)) return;
+    if (eligible()) await this.syncWithServer(true);
+  }
+  async syncWithServer(pullOnly = false) {
+    var _a, _b, _c;
     if (this.syncing) {
       new import_obsidian.Notice("Sync already in progress.");
       return;
@@ -708,6 +817,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       const manifest = await transport.manifest();
       if (manifest.protocol_version !== PROTOCOL_VERSION) throw new Error("unsupported protocol version");
       const local = await this.localHashes();
+      if (pullOnly && !isLocalClean(this.syncState, local)) return;
       const server = {};
       for (const file of manifest.files) server[validateRelativePath(file.path)] = file;
       const decisions = planSync(this.syncState, local, server);
@@ -720,15 +830,15 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
             const bytes = base64ToBytes(file.content_base64);
             if (await this.hash(bytes.buffer) !== decision.serverHash) throw new Error("Corrupted file transfer");
             if (decision.reason === "server-authoritative-overwrite") await this.cacheLocalBeforeOverwrite(decision.path, manifest.revision_id);
-            const result = await this.writeFile(decision.path, bytes);
-            if (result.status === "conflict") reviews.push(`${decision.path}: ${(_a = result.reason) != null ? _a : "path collision; manual review required"}`);
+            const result = await this.writeFile(decision.path, bytes, "pull", pullOnly ? (_a = local[decision.path]) != null ? _a : null : void 0);
+            if (result.status === "conflict") reviews.push(`${decision.path}: ${(_b = result.reason) != null ? _b : "path collision; manual review required"}`);
             else this.syncState.files[decision.path] = { baseHash: decision.serverHash };
-          } else if (decision.kind === "submit") {
+          } else if (decision.kind === "submit" && !pullOnly) {
             const pending = await this.pendingFor(decision.path, decision.operation, manifest.revision_id);
             if (pending) this.syncState.pendingSubmissions.push(pending);
           } else if (decision.kind === "clean") this.syncState.files[decision.path] = { baseHash: decision.hash };
           else if (decision.kind === "conflict") {
-            reviews.push(`${decision.path}: ${(_b = decision.reason) != null ? _b : "manual review required"}`);
+            reviews.push(`${decision.path}: ${(_c = decision.reason) != null ? _c : "manual review required"}`);
             await this.cacheConflict(transport, manifest.revision_id, decision);
           }
         } catch (error) {
@@ -751,7 +861,6 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice(`Sync failed: ${safeError(error)}. State was retained.`);
     } finally {
       this.syncing = false;
-      this.updateStatus();
     }
   }
   async pendingFor(path, operation, baseRevisionId) {
@@ -922,9 +1031,11 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       if (info.protocol_version !== PROTOCOL_VERSION || info.vault_id && info.vault_id !== this.settings.vaultId || !serverFingerprintMatches(this.settings.serverFingerprint, info.server_fingerprint)) throw new Error("server identity does not match settings");
       this.updateStatus();
       if (!silent) new import_obsidian.Notice(`Server protocol version: ${info.protocol_version}.`);
+      return true;
     } catch (error) {
       this.updateStatus(true);
       if (!silent) new import_obsidian.Notice(`Version check failed: ${safeError(error)}`);
+      return false;
     }
   }
   exportableConfiguration() {
@@ -954,10 +1065,13 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     const credentials = config.setup_token ? await new RequestUrlTransport(next).redeemSetup(config.setup_token) : void 0;
     if (credentials && (!validSession(credentials) || !credentials.device_token)) throw new Error("Invalid pairing session");
     this.settings = next;
-    this.enrollment = void 0;
+    this.clearCredentials();
+    this.pairingStatus = { kind: "not-paired" };
     if (credentials) {
       this.deviceToken = credentials.device_token;
       this.session = { ticket: credentials.ticket, expires_at: credentials.expires_at };
+      this.credentialBinding = this.binding();
+      this.pairingStatus = { kind: "ready" };
     }
     await this.saveSettings();
   }
@@ -1051,6 +1165,12 @@ var AuthoritySettingTab = class extends import_obsidian.PluginSettingTab {
       await this.plugin.syncWithServer();
       this.display();
     })).addButton((b) => b.setButtonText("Copy configuration link").onClick(() => void this.plugin.exportConfiguration())).addButton((b) => b.setButtonText("Paste setup/config link").onClick(() => void this.plugin.importSetupConfiguration())).addButton((b) => b.setButtonText("Open conflicts").onClick(() => void this.plugin.openConflicts())).addButton((b) => b.setButtonText("Pending submissions").onClick(() => void this.plugin.openPendingSubmissions()));
+    actions.addButton((b) => b.setButtonText("Submit pending changes").setDisabled(this.plugin.submitting).onClick(() => void this.plugin.submitPendingChanges()));
+    actions.addButton((b) => b.setButtonText("Reset pairing state").setDisabled(this.plugin.pairing).onClick(async () => {
+      await this.plugin.resetPairingState();
+      this.display();
+    }));
+    actions.addButton((b) => b.setButtonText("Copy diagnostics").onClick(() => void this.plugin.copyDiagnostics()));
     applyActionRowLayout(actions.controlEl);
   }
 };
