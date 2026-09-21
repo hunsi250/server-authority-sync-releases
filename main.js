@@ -435,6 +435,7 @@ var RequestUrlTransport = class {
       return Object.assign(new Error(message), { status, code, diagnostic });
     };
     if (authenticated) {
+      if (this.enrollment && Date.parse(this.enrollment.expires_at) <= Date.now()) this.enrollment = void 0;
       if (this.enrollment) {
         if (!this.enrollment.request_id || !this.enrollment.poll_secret || !(Date.parse(this.enrollment.expires_at) > Date.now())) throw new Error("Enrollment session expired. Test and pair again.");
         const vault = `/vaults/${encodeURIComponent(this.settings.vaultId)}`;
