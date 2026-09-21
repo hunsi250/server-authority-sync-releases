@@ -418,7 +418,7 @@ var LOCAL_REASONS = {
 function localFailure(stage, reason, requestSent = false) {
   return Object.assign(new Error(LOCAL_REASONS[reason]), { diagnostic: { stage, reason, retryCount: 0, retryable: false, requestSent } });
 }
-var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted", "invalid_response", "vault_unreadable", "internal_error", "request_too_large", "file_too_large", "identity_mismatch"]);
+var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted", "invalid_response", "vault_unreadable", "internal_error", "request_too_large", "file_too_large", "identity_mismatch", "request_timeout", "server_busy"]);
 function normalizeDiagnostics(value) {
   if (!Array.isArray(value)) return [];
   return value.filter((item) => {
