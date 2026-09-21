@@ -140,12 +140,32 @@ function classifySubmitResult(result) {
   if (result.status === 208 || result.code === "already_submitted") return "already-sent-skipped";
   return "non-retryable-blocked";
 }
+function validCredential(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,512}$/.test(value);
+}
+function sessionStructure(value) {
+  const s = value;
+  return !!s && typeof s.ticket === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(s.ticket) && typeof s.expires_at === "string" && Number.isFinite(Date.parse(s.expires_at));
+}
+function enrollmentStructure(value) {
+  const e = value;
+  return !!e && validCredential(e.request_id) && validCredential(e.poll_secret) && typeof e.expires_at === "string" && Number.isFinite(Date.parse(e.expires_at));
+}
 function validSession(value) {
-  const session = value;
-  return !!session && typeof session.ticket === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(session.ticket) && Date.parse(session.expires_at) > Date.now();
+  return sessionStructure(value) && Date.parse(value.expires_at) > Date.now();
+}
+function validEnrollment(value) {
+  return enrollmentStructure(value) && Date.parse(value.expires_at) > Date.now();
+}
+function credentialState(input, binding) {
+  if (!validCredential(input.device_token) && !sessionStructure(input.session) && !enrollmentStructure(input.enrollment)) return "missing";
+  if (input.credentialBinding !== binding) return "invalid-binding";
+  if (validEnrollment(input.enrollment)) return "enrollment";
+  if (validSession(input.session)) return "session";
+  return validCredential(input.device_token) ? "renewable" : "missing";
 }
 function shouldRenewSession(session, deviceToken) {
-  return typeof deviceToken === "string" && deviceToken.length > 0 && !validSession(session);
+  return validCredential(deviceToken) && !validSession(session);
 }
 async function pairDevice(transport, identity, save, pending, wait = () => new Promise((resolve) => setTimeout(resolve, 2e3)), active = () => true, creating = () => {
 }) {
@@ -173,15 +193,8 @@ async function pairDevice(transport, identity, save, pending, wait = () => new P
   }
   throw new Error("Pairing expired or was cancelled. Test and pair again.");
 }
-var PAIRING_KINDS = /* @__PURE__ */ new Set(["not-paired", "testing", "creating", "saving", "waiting", "approved", "ready", "expired", "settings-changed", "server-rejected", "connection-failed", "save-failed"]);
-function normalizePairingStatus(value) {
-  if (!value || typeof value !== "object") return { kind: "not-paired" };
-  const input = value;
-  const kind = typeof input.kind === "string" && PAIRING_KINDS.has(input.kind) ? input.kind : "not-paired";
-  return { kind };
-}
 function pairingStatusLabel(status) {
-  const labels = { "not-paired": "Not paired", testing: "Checking server identity", creating: "Creating pairing request", saving: "Saving pairing credentials", waiting: "Waiting for administrator approval", approved: "Pairing approved; saving credentials", ready: "Paired and ready", expired: "Pairing expired", "settings-changed": "Pairing stopped: settings changed", "server-rejected": "Pairing failed: server rejected the request", "connection-failed": "Pairing failed: connection failure", "save-failed": "Pairing failed: credentials could not be saved" };
+  const labels = { recovering: "Recovering saved credentials; retry sync if offline", "binding-mismatch": "Saved credentials do not match these settings; restore the previous settings or Test and pair", "not-paired": "Not paired", testing: "Checking server identity", creating: "Creating pairing request", saving: "Saving pairing credentials", waiting: "Waiting for administrator approval", approved: "Pairing approved; saving credentials", ready: "Paired and ready", expired: "Pairing expired", "settings-changed": "Pairing stopped: settings changed", "server-rejected": "Pairing failed: server rejected the request", "connection-failed": "Pairing failed: connection failure", "save-failed": "Pairing failed: credentials could not be saved" };
   return labels[status.kind] + (status.reason ? ` (${status.reason})` : "");
 }
 function transitionPairingStatus(status, event) {
@@ -366,18 +379,33 @@ function userFacingServerError(status, payload) {
   return "\u670D\u52A1\u5668\u8FDE\u63A5\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002";
 }
 function safeError(error) {
+  var _a;
   if (!(error instanceof Error)) return "Operation failed. Check diagnostics, connection and pairing; retry after resolving the problem";
+  const reason = (_a = error.diagnostic) == null ? void 0 : _a.reason;
+  if (reason && reason in LOCAL_REASONS) return LOCAL_REASONS[reason];
   const message = error.message;
-  const safe = /^(Set a server URL first|unsupported protocol version|Server identity does not match settings|Credential storage failed(?:\.|$)|Session expired or unavailable\. Test and pair again\.|Enrollment session expired\. Test and pair again\.|Server returned an invalid session\. Test and pair again\.|Pairing cancelled: settings changed\.|Unable to save pairing\.)$/i;
+  const safe = /^(Set a server URL first|unsupported protocol version|Server identity does not match settings|Server connection failed|Authentication rejected\..*|Session expired or unavailable\. Test and pair again\.|Server returned an invalid session\. Test and pair again\.|Pairing cancelled: settings changed\.|Unable to save pairing\.)$/i;
   return safe.test(message) ? message : "Operation failed. Check diagnostics, connection and pairing; retry after resolving the problem";
 }
-var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted"]);
+var LOCAL_REASONS = {
+  missing_credentials: "No usable credentials in PluginData. Open Advanced settings \u2192 Test and pair.",
+  credentials_rejected: "The server rejected the saved credentials. Open Advanced settings \u2192 Test and pair.",
+  invalid_binding: "Saved credentials belong to different or unverified settings. Check settings, then Test and pair.",
+  persistence_failure: "Credential storage could not be verified. Check plugin storage permissions/free space, then retry saving or pairing.",
+  invalid_settings: "Set a server URL first and check API prefix, Vault ID and fingerprint in Advanced settings.",
+  invalid_response: "The server response was invalid. Check server compatibility and retry.",
+  local_operation_failed: "Local sync processing failed. Check vault access and retry; state was retained."
+};
+function localFailure(stage, reason) {
+  return Object.assign(new Error(LOCAL_REASONS[reason]), { diagnostic: { stage, reason, retryCount: 0, retryable: false } });
+}
+var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted", "invalid_response"]);
 function normalizeDiagnostics(value) {
   if (!Array.isArray(value)) return [];
   return value.filter((item) => {
     if (!item || typeof item !== "object") return false;
     const d = item;
-    return typeof d.stage === "string" && d.stage.length <= 64 && (d.status === void 0 || Number.isInteger(d.status) && d.status >= 100 && d.status <= 599) && (d.code === void 0 || typeof d.code === "string" && SAFE_CODES.has(d.code)) && (d.requestId === void 0 || typeof d.requestId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(d.requestId)) && typeof d.retryCount === "number" && Number.isInteger(d.retryCount) && d.retryCount >= 0 && typeof d.retryable === "boolean";
+    return (d.reason === void 0 || Object.prototype.hasOwnProperty.call(LOCAL_REASONS, d.reason)) && typeof d.stage === "string" && d.stage.length <= 64 && (d.status === void 0 || Number.isInteger(d.status) && d.status >= 100 && d.status <= 599) && (d.code === void 0 || typeof d.code === "string" && SAFE_CODES.has(d.code)) && (d.requestId === void 0 || typeof d.requestId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(d.requestId)) && typeof d.retryCount === "number" && Number.isInteger(d.retryCount) && d.retryCount >= 0 && typeof d.retryable === "boolean";
   }).slice(-20);
 }
 function requestStage(path) {
@@ -393,16 +421,25 @@ function requestStage(path) {
 function waitMs(ms) {
   return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 }
+function apiErrorEnvelope(payload) {
+  var _a;
+  return !!payload && typeof payload === "object" && typeof ((_a = payload.error) == null ? void 0 : _a.code) === "string";
+}
 var RequestUrlTransport = class {
-  constructor(settings, session, enrollment, deviceToken = "", saveSession, recordDiagnostic, credentialsSaved) {
+  constructor(settings, session, enrollment, deviceToken = "", saveSession, recordDiagnostic, discardEnrollment, unauthorized) {
     this.settings = settings;
     this.session = session;
     this.enrollment = enrollment;
     this.deviceToken = deviceToken;
     this.saveSession = saveSession;
     this.recordDiagnostic = recordDiagnostic;
-    this.credentialsSaved = credentialsSaved;
+    this.discardEnrollment = discardEnrollment;
+    this.unauthorized = unauthorized;
     __publicField(this, "renewal");
+    __publicField(this, "rejected", false);
+  }
+  async recover() {
+    if (!validEnrollment(this.enrollment) && shouldRenewSession(this.session, this.deviceToken)) await this.renewSession();
   }
   renewSession() {
     if (!this.renewal) this.renewal = this.performRenewal().finally(() => {
@@ -411,64 +448,73 @@ var RequestUrlTransport = class {
     return this.renewal;
   }
   async performRenewal() {
-    var _a, _b, _c, _d;
+    var _a, _b, _c, _d, _e;
     if (!this.deviceToken) throw new Error("Session expired or unavailable. Test and pair again.");
     let renewed;
     try {
       renewed = await this.request("POST", "/enrollments/session", { device_token: this.deviceToken });
     } catch (error) {
-      const details = error && typeof error === "object" ? error : {};
-      const diagnostic = (_a = details.diagnostic) != null ? _a : details;
-      const status = diagnostic.status ? `HTTP ${diagnostic.status}` : "network/response error";
-      const code = diagnostic.code ? `, code ${diagnostic.code}` : "";
-      throw new Error(`Session renewal failed (${status}${code}). Test and pair again.`);
+      if (error.status === 401 && error.authority) {
+        this.rejected = true;
+        await ((_a = this.unauthorized) == null ? void 0 : _a.call(this));
+        const rejected = localFailure("session", "credentials_rejected");
+        (_b = this.recordDiagnostic) == null ? void 0 : _b.call(this, { stage: "session", status: 401, code: "unauthorized", retryCount: 0, retryable: false });
+        throw rejected;
+      }
+      throw error;
     }
     if (!validSession(renewed)) {
-      (_b = this.recordDiagnostic) == null ? void 0 : _b.call(this, { stage: "session", code: "invalid_response", retryCount: 0, retryable: false });
+      (_c = this.recordDiagnostic) == null ? void 0 : _c.call(this, { stage: "session", code: "invalid_response", retryCount: 0, retryable: false });
       throw new Error("Server returned an invalid session. Test and pair again.");
     }
     try {
-      await ((_c = this.saveSession) == null ? void 0 : _c.call(this, renewed));
+      await ((_d = this.saveSession) == null ? void 0 : _d.call(this, renewed));
     } catch (e) {
       this.session = void 0;
-      (_d = this.recordDiagnostic) == null ? void 0 : _d.call(this, { stage: "save", retryCount: 0, retryable: false });
-      throw new Error("Credential storage failed. Test and pair again.");
+      const error = localFailure("storage", "persistence_failure");
+      (_e = this.recordDiagnostic) == null ? void 0 : _e.call(this, error.diagnostic);
+      throw error;
     }
     this.session = renewed;
   }
   async request(method, path, body, authenticated = false, retried = false) {
-    if (this.credentialsSaved && !await this.credentialsSaved) throw new Error("Credential storage failed. Test and pair again.");
+    var _a, _b, _c;
+    const originalPath = path, originalBody = body;
     const stage = requestStage(path);
+    const local = (reason) => {
+      var _a2;
+      const error = localFailure(stage, reason);
+      (_a2 = this.recordDiagnostic) == null ? void 0 : _a2.call(this, error.diagnostic);
+      return error;
+    };
+    if (authenticated && this.rejected) throw local("missing_credentials");
     const failure = (message, status, payload2, headers) => {
-      var _a, _b, _c;
+      var _a2, _b2, _c2;
       let code, requestId;
       try {
-        const candidate = (_a = payload2 == null ? void 0 : payload2.error) == null ? void 0 : _a.code;
+        const candidate = (_a2 = payload2 == null ? void 0 : payload2.error) == null ? void 0 : _a2.code;
         if (typeof candidate === "string" && SAFE_CODES.has(candidate)) code = candidate;
-        const id = (_b = Object.entries(headers != null ? headers : {}).find(([key]) => key.toLowerCase() === "x-request-id")) == null ? void 0 : _b[1];
+        const id = (_b2 = Object.entries(headers != null ? headers : {}).find(([key]) => key.toLowerCase() === "x-request-id")) == null ? void 0 : _b2[1];
         if (id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) requestId = id;
       } catch (e) {
       }
       const diagnostic = { stage, status, code, requestId, retryCount: retried ? 1 : 0, retryable: status === void 0 || status === 408 || status === 429 || status >= 500 };
-      (_c = this.recordDiagnostic) == null ? void 0 : _c.call(this, diagnostic);
-      return Object.assign(new Error(message), { status, code, diagnostic });
+      (_c2 = this.recordDiagnostic) == null ? void 0 : _c2.call(this, diagnostic);
+      return Object.assign(new Error(message), { status, code, diagnostic, authority: apiErrorEnvelope(payload2) });
     };
     if (authenticated) {
-      if (this.enrollment) {
-        const enrollmentExpiry = Date.parse(this.enrollment.expires_at);
-        if (this.enrollment.expires_at === "") throw new Error("Enrollment session expired. Test and pair again.");
-        if (!Number.isFinite(enrollmentExpiry) || enrollmentExpiry <= Date.now()) this.enrollment = void 0;
+      if (this.enrollment && !validEnrollment(this.enrollment)) {
+        this.enrollment = void 0;
+        await ((_a = this.discardEnrollment) == null ? void 0 : _a.call(this));
       }
       if (this.enrollment) {
-        const enrollmentExpiry = Date.parse(this.enrollment.expires_at);
-        if (!this.enrollment.request_id || !this.enrollment.poll_secret || !Number.isFinite(enrollmentExpiry) || !(enrollmentExpiry > Date.now())) throw new Error("Enrollment session expired. Test and pair again.");
         const vault = `/vaults/${encodeURIComponent(this.settings.vaultId)}`;
         const operation = path === `${vault}/manifest` ? { type: "manifest" } : path.startsWith(`${vault}/files/`) ? { type: "read-file", path: decodeURIComponent(path.slice(`${vault}/files/`.length)) } : path === "/submissions/list" ? { type: "list-submissions" } : { type: "submit", submission: body };
         path = `/enrollments/${encodeURIComponent(this.enrollment.request_id)}/poll`;
         body = { protocol_version: PROTOCOL_VERSION, vault_id: this.settings.vaultId, server_fingerprint: this.settings.serverFingerprint, poll_secret: this.enrollment.poll_secret, operation };
       } else {
         if (shouldRenewSession(this.session, this.deviceToken)) await this.renewSession();
-        if (!validSession(this.session)) throw new Error("Session expired or unavailable. Test and pair again.");
+        if (!validSession(this.session)) throw local("missing_credentials");
         body = { ...body, ticket: this.session.ticket };
       }
     }
@@ -489,19 +535,26 @@ var RequestUrlTransport = class {
     try {
       payload = response.json;
     } catch (e) {
-      throw failure("Invalid server response", response.status, void 0, response.headers);
+      if (response.status !== 401) throw failure("Invalid server response", response.status, void 0, response.headers);
     }
     if (authenticated && response.status === 401) {
+      if (!apiErrorEnvelope(payload)) {
+        const intermediary = failure("Rejected with HTTP 401 without an API error envelope; a proxy or edge rule may be blocking the request. Credentials were kept.", response.status, payload, response.headers);
+        throw intermediary;
+      }
+      const error = failure("Authentication rejected. Test and pair again if renewal is unauthorized.", response.status, payload, response.headers);
       this.session = void 0;
       if (this.enrollment) {
-        this.enrollment.expires_at = "";
-        throw failure("Session expired or revoked. Test and pair again.", response.status, payload, response.headers);
+        this.enrollment = void 0;
+        await ((_b = this.discardEnrollment) == null ? void 0 : _b.call(this));
       }
       if (!retried && this.deviceToken) {
         await this.renewSession();
-        return this.request(method, path, body, authenticated, true);
+        return this.request(method, originalPath, originalBody, authenticated, true);
       }
-      throw failure("Session expired or revoked. Test and pair again.", response.status, payload, response.headers);
+      this.rejected = true;
+      await ((_c = this.unauthorized) == null ? void 0 : _c.call(this));
+      throw error;
     }
     if (response.status < 200 || response.status >= 300) {
       let message;
@@ -548,7 +601,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "errors", []);
     __publicField(this, "diagnosticSequence", 0);
     __publicField(this, "credentialBinding");
-    __publicField(this, "credentialsSaved");
+    __publicField(this, "recovery");
     __publicField(this, "recordDiagnostic", (diagnostic) => {
       this.errors = [...this.errors.slice(-19), diagnostic];
       this.diagnosticSequence++;
@@ -569,9 +622,17 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "localDirty", false);
     __publicField(this, "statusListener");
     __publicField(this, "changeVersions", /* @__PURE__ */ new Map());
+    __publicField(this, "storageFailed", false);
+    __publicField(this, "writes", Promise.resolve());
+    __publicField(this, "lastVerified", "");
   }
   binding() {
     return JSON.stringify([this.settings.serverUrl, this.settings.apiPrefix, this.settings.vaultId, this.settings.serverFingerprint]);
+  }
+  /** The only source of a user-visible pairing label; derived from credentials that actually exist. */
+  derivedStatus() {
+    const state = credentialState({ credentialBinding: this.credentialBinding, device_token: this.deviceToken, session: this.session, enrollment: this.enrollment }, this.binding());
+    return { kind: state === "enrollment" || state === "session" ? "ready" : state === "renewable" ? "recovering" : state === "invalid-binding" ? "binding-mismatch" : "not-paired" };
   }
   clearCredentials() {
     this.deviceToken = "";
@@ -580,12 +641,16 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.credentialBinding = void 0;
   }
   diagnosticSummary() {
-    var _a, _b, _c;
+    var _a, _b, _c, _d;
     const d = this.errors[this.errors.length - 1];
-    return d ? `Stage: ${d.stage} \xB7 HTTP: ${(_a = d.status) != null ? _a : "unavailable"} \xB7 Code: ${(_b = d.code) != null ? _b : "unavailable"} \xB7 Request ID: ${(_c = d.requestId) != null ? _c : "unavailable"}. ${d.status === 401 || d.status === 403 ? "Test and pair again." : d.retryable ? "Check connection and retry." : "Check settings and review before retrying."}` : "No request failures recorded.";
+    if (!d) return "No request failures recorded.";
+    const recovery = d.status === 401 ? " Authentication rejected; automatic recovery was attempted. If still unpaired, Test and pair." : d.retryable ? " Check connection and retry." : " Check settings and retry.";
+    const detail = d.reason ? `No HTTP request was made for this stage: ${LOCAL_REASONS[d.reason]}` : d.status === void 0 ? d.code === "invalid_response" ? "The server answered, but the response was not usable and no HTTP status was recorded." : "No HTTP response was recorded for this stage: the connection failed before a response arrived." : `HTTP: ${d.status} \xB7 Code: ${(_a = d.code) != null ? _a : "not supplied"} \xB7 Request ID: ${(_b = d.requestId) != null ? _b : "not supplied"}.${recovery}`;
+    return `Plugin ${(_d = (_c = this.manifest) == null ? void 0 : _c.version) != null ? _d : "unknown"} \xB7 Stage: ${d.stage} \xB7 ${detail}`;
   }
   diagnosticsText() {
-    return JSON.stringify({ errors: this.errors }, null, 2);
+    var _a, _b;
+    return JSON.stringify({ pluginVersion: (_b = (_a = this.manifest) == null ? void 0 : _a.version) != null ? _b : "unknown", errors: this.errors }, null, 2);
   }
   async copyDiagnostics() {
     try {
@@ -602,25 +667,31 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.updateStatus();
   }
   async onload() {
-    const data = await this.loadData();
+    let data = null;
+    try {
+      data = await this.loadData();
+    } catch (e) {
+      this.storageFailed = true;
+    }
     this.errors = normalizeDiagnostics(data == null ? void 0 : data.errors);
     this.settings = mergeSettings(data == null ? void 0 : data.settings);
-    this.deviceToken = typeof (data == null ? void 0 : data.device_token) === "string" ? data.device_token : "";
-    this.session = validSession(data == null ? void 0 : data.session) ? data.session : void 0;
-    this.enrollment = data == null ? void 0 : data.enrollment;
-    this.pairingStatus = normalizePairingStatus(data == null ? void 0 : data.pairingStatus);
-    if (this.session && this.pairingStatus.kind === "not-paired") this.pairingStatus = { kind: "ready" };
+    this.deviceToken = validCredential(data == null ? void 0 : data.device_token) ? data.device_token : "";
+    this.session = sessionStructure(data == null ? void 0 : data.session) ? data.session : void 0;
+    this.enrollment = enrollmentStructure(data == null ? void 0 : data.enrollment) ? data.enrollment : void 0;
     this.credentialBinding = data == null ? void 0 : data.credentialBinding;
     this.syncState = normalizeSyncState(data == null ? void 0 : data.sync);
-    if (!this.credentialBinding || this.credentialBinding !== this.binding()) {
-      this.clearCredentials();
-      this.pairingStatus = { kind: "not-paired" };
+    const state = credentialState(data != null ? data : {}, this.binding());
+    this.pairingStatus = this.derivedStatus();
+    if (this.storageFailed) {
+      this.pairingStatus = { kind: "save-failed" };
+      this.recordDiagnostic(localFailure("storage", "persistence_failure").diagnostic);
+    } else if (state === "invalid-binding") {
       this.settings.syncPolicy = "manual";
-      await this.saveSettings();
-    }
-    if (this.pairingStatus.kind === "ready" && !this.deviceToken && !this.session && !this.enrollment) {
-      this.pairingStatus = { kind: "not-paired" };
-      await this.saveSettings();
+      this.recordDiagnostic(localFailure("load", "invalid_binding").diagnostic);
+      await this.saveSettings().catch(() => void 0);
+    } else if (state === "missing" && data) {
+      this.recordDiagnostic(localFailure("load", "missing_credentials").diagnostic);
+      await this.saveSettings().catch(() => void 0);
     }
     this.statusBar = this.addStatusBarItem();
     this.updateStatus();
@@ -645,6 +716,10 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
         if (connected) return this.autoPull();
       }).catch(() => this.updateStatus(true));
     }, Math.max(1, this.settings.autoCheckIntervalMinutes) * 6e4));
+    if (state === "renewable") {
+      this.recovery = this.transport().recover().catch(() => {
+      });
+    }
   }
   onunload() {
     this.unloaded = true;
@@ -655,7 +730,8 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       return;
     }
     this.pairing = true;
-    this.clearCredentials();
+    const previous = { deviceToken: this.deviceToken, session: this.session, enrollment: this.enrollment, credentialBinding: this.credentialBinding };
+    let reported = false;
     const snapshot = { ...this.settings };
     const active = () => !this.unloaded && ["serverUrl", "apiPrefix", "vaultId", "serverFingerprint"].every((key) => this.settings[key] === snapshot[key]);
     const setPairing = async (status) => {
@@ -676,10 +752,9 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
         try {
           await this.saveSettings();
         } catch (e) {
-          this.clearCredentials();
-          this.recordDiagnostic({ stage: "save", retryCount: 0, retryable: false });
           throw new Error("Unable to save pairing.");
         }
+        if (!active()) throw new Error("Pairing cancelled: settings changed.");
       }, async () => {
         this.pairingStatus = transitionPairingStatus(this.pairingStatus, "waiting");
         await this.saveSettings();
@@ -690,15 +765,24 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       });
       await setPairing(transitionPairingStatus(this.pairingStatus, "saved"));
     } catch (error) {
-      this.clearCredentials();
+      this.deviceToken = previous.deviceToken;
+      this.session = previous.session;
+      this.enrollment = previous.enrollment;
+      this.credentialBinding = previous.credentialBinding;
+      const diagnostic = error == null ? void 0 : error.diagnostic;
       const message = error instanceof Error ? error.message.toLowerCase() : "";
-      const event = !active() ? "settings-changed" : message.includes("connection") ? "connection-failed" : message.includes("reject") || message.includes("identity") ? "server-rejected" : message.includes("expired") || message.includes("cancel") ? "expired" : message.includes("save") ? "save-failed" : "server-rejected";
-      this.pairingStatus = transitionPairingStatus(this.pairingStatus, event);
+      const event = !active() ? "settings-changed" : (diagnostic == null ? void 0 : diagnostic.reason) === "persistence_failure" || message.includes("unable to save") ? "save-failed" : (diagnostic == null ? void 0 : diagnostic.reason) === "invalid_settings" || (diagnostic == null ? void 0 : diagnostic.reason) === "invalid_binding" ? "server-rejected" : message.includes("connection") ? "connection-failed" : message.includes("cancel") || message.includes("expired") ? "expired" : "server-rejected";
+      const restored = !!(this.deviceToken || this.session || this.enrollment);
+      this.pairingStatus = this.storageFailed ? { kind: "save-failed" } : restored ? this.derivedStatus() : transitionPairingStatus(this.pairingStatus, event);
       await this.saveSettings().catch(() => void 0);
+      if (!this.unloaded) {
+        reported = true;
+        new import_obsidian.Notice(`Pairing attempt failed: ${safeError(error)}${restored ? " Existing credentials were kept." : ""}`, 15e3);
+      }
     } finally {
       this.pairing = false;
       this.updateStatus();
-      if (!this.unloaded) new import_obsidian.Notice(pairingStatusLabel(this.pairingStatus), 1e4);
+      if (!this.unloaded && !reported) new import_obsidian.Notice(pairingStatusLabel(this.pairingStatus), 1e4);
     }
   }
   statusText() {
@@ -726,38 +810,94 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       this.updateStatus();
     }
   }
+  credentialSignature() {
+    var _a, _b, _c;
+    return JSON.stringify([(_a = this.credentialBinding) != null ? _a : null, this.deviceToken, (_b = this.session) != null ? _b : null, (_c = this.enrollment) != null ? _c : null]);
+  }
+  /** Serialize whole PluginData snapshots; verify credential-changing writes through Obsidian's own storage API. */
+  persist() {
+    const operation = this.writes.catch(() => void 0).then(async () => {
+      var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
+      const data = JSON.parse(JSON.stringify({ settings: this.settings, credentialBinding: this.credentialBinding, device_token: this.deviceToken, session: this.session, enrollment: this.enrollment, pairingStatus: this.pairingStatus, sync: this.syncState, errors: this.errors }));
+      const signature = this.credentialSignature();
+      const verify = signature !== this.lastVerified && typeof this.loadData === "function";
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await this.saveData(data);
+          if (verify) {
+            const read = await this.loadData();
+            if (!read || ((_a = read.credentialBinding) != null ? _a : null) !== ((_b = data.credentialBinding) != null ? _b : null) || ((_c = read.device_token) != null ? _c : "") !== ((_d = data.device_token) != null ? _d : "") || JSON.stringify((_e = read.session) != null ? _e : null) !== JSON.stringify((_f = data.session) != null ? _f : null) || JSON.stringify((_g = read.enrollment) != null ? _g : null) !== JSON.stringify((_h = data.enrollment) != null ? _h : null) || (data.device_token ? !validCredential(read.device_token) : false) || (data.session ? !sessionStructure(read.session) : false) || (data.enrollment ? !enrollmentStructure(read.enrollment) : false) || JSON.stringify((_i = read.settings) != null ? _i : null) !== JSON.stringify((_j = data.settings) != null ? _j : null)) throw new Error("credential read-back mismatch");
+          }
+          this.storageFailed = false;
+          this.lastVerified = signature;
+          return;
+        } catch (e) {
+          if (attempt > 0) {
+            this.storageFailed = true;
+            const error = localFailure("storage", "persistence_failure");
+            this.recordDiagnostic(error.diagnostic);
+            throw error;
+          }
+        }
+      }
+    });
+    this.writes = operation;
+    return operation;
+  }
   async saveSettings() {
     this.settings = mergeSettings(this.settings);
-    if (this.credentialBinding && this.credentialBinding !== this.binding()) {
-      this.clearCredentials();
-      this.pairingStatus = { kind: "settings-changed" };
-    }
-    await this.saveData({ settings: this.settings, credentialBinding: this.credentialBinding, device_token: this.deviceToken, session: this.session, enrollment: this.enrollment, pairingStatus: this.pairingStatus, sync: this.syncState, errors: this.errors });
-    this.credentialsSaved = void 0;
+    await this.persist();
   }
   async saveSync() {
-    await this.saveData({ settings: this.settings, credentialBinding: this.credentialBinding, device_token: this.deviceToken, session: this.session, enrollment: this.enrollment, pairingStatus: this.pairingStatus, sync: this.syncState, errors: this.errors });
+    await this.persist();
     this.updateStatus();
   }
   transport() {
-    if (this.credentialBinding && this.credentialBinding !== this.binding()) {
-      this.clearCredentials();
-      this.pairingStatus = { kind: "settings-changed" };
-      this.credentialsSaved = this.saveSettings().then(() => true, () => false);
+    if (this.storageFailed) {
+      this.pairingStatus = { kind: "save-failed" };
+      this.updateStatus();
+      throw localFailure("storage", "persistence_failure");
     }
-    if (!this.settings.serverUrl) throw new Error("Set a server URL first");
+    const bound = !!this.credentialBinding && this.credentialBinding === this.binding();
+    const hasCredentials = !!(this.deviceToken || this.session || this.enrollment);
+    if (hasCredentials && !bound) {
+      this.pairingStatus = { kind: "binding-mismatch" };
+      const error = localFailure("settings", "invalid_binding");
+      this.recordDiagnostic(error.diagnostic);
+      throw error;
+    }
+    try {
+      validateServerUrl(this.settings.serverUrl);
+      validateApiPrefix(this.settings.apiPrefix);
+      if (typeof this.settings.vaultId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(this.settings.vaultId)) throw new Error();
+      if (this.settings.serverFingerprint) validateServerFingerprint(this.settings.serverFingerprint);
+    } catch (e) {
+      const error = localFailure("settings", "invalid_settings");
+      this.recordDiagnostic(error.diagnostic);
+      throw error;
+    }
     const binding = this.binding();
+    const checkBinding = () => {
+      if (binding !== this.binding() || this.unloaded) throw localFailure("credentials", "invalid_binding");
+    };
     return new RequestUrlTransport({ ...this.settings }, this.session, this.enrollment, this.deviceToken, async (session) => {
-      if (binding !== this.binding()) throw new Error("Settings changed during session renewal");
+      checkBinding();
       this.session = session;
-      try {
-        if (typeof this.saveData === "function") await this.saveSettings();
-      } catch (e) {
-        this.clearCredentials();
-        this.pairingStatus = { kind: "save-failed" };
-        throw new Error("Credential storage failed");
-      }
-    }, this.recordDiagnostic, this.credentialsSaved);
+      if (typeof this.saveData === "function") await this.saveSettings();
+      checkBinding();
+      this.pairingStatus = { kind: "ready" };
+      this.updateStatus();
+    }, this.recordDiagnostic, async () => {
+      checkBinding();
+      this.enrollment = void 0;
+      if (typeof this.saveData === "function") await this.saveSettings();
+    }, async () => {
+      checkBinding();
+      this.clearCredentials();
+      this.pairingStatus = { kind: "not-paired" };
+      if (typeof this.saveData === "function") await this.saveSettings();
+      this.updateStatus();
+    });
   }
   included(file) {
     return !this.isLocalPluginPath(file.path) && !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/workspace`) && !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/cache/`) && !file.path.endsWith("/.authority.sqlite3") && file.path !== ".authority.sqlite3";
@@ -864,7 +1004,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     if (eligible()) await this.syncWithServer(true);
   }
   async syncWithServer(pullOnly = false) {
-    var _a, _b, _c;
+    var _a, _b, _c, _d;
     if (this.syncing || this.submitting || this.pairing) {
       new import_obsidian.Notice("Sync already in progress.");
       return;
@@ -904,7 +1044,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
             await this.cacheConflict(transport, manifest.revision_id, decision);
           }
         } catch (error) {
-          throw new Error(`${decision.path}: ${safeError(error)}`);
+          throw Object.assign(new Error(`${decision.path}: ${safeError(error)}`), { diagnostic: error == null ? void 0 : error.diagnostic });
         }
         await this.saveSync();
       }
@@ -916,19 +1056,16 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       if (activeConflict) new import_obsidian.Notice("\u5F53\u524D\u7B14\u8BB0\u5B58\u5728\u672A\u89E3\u51B3\u51B2\u7A81\uFF1B\u672C\u5730\u5185\u5BB9\u672A\u88AB\u8986\u76D6\u3002");
       new import_obsidian.Notice(syncNotice(decisions, reviews, [], manifest.files.length));
     } catch (error) {
-      const pairingRequired = error instanceof Error && /^(Enrollment session expired|Session expired or unavailable)/.test(error.message);
-      if (pairingRequired) {
-        this.clearCredentials();
-        this.pairingStatus = { kind: "not-paired" };
-        await this.saveSettings().catch(() => void 0);
-      }
-      if (this.diagnosticSequence === diagnosticsBefore) this.recordDiagnostic({ stage: "local", retryCount: 0, retryable: false });
+      const diagnostic = error == null ? void 0 : error.diagnostic;
+      const pairingRequired = (diagnostic == null ? void 0 : diagnostic.reason) === "missing_credentials" || (diagnostic == null ? void 0 : diagnostic.reason) === "credentials_rejected" || this.pairingStatus.kind === "not-paired" && ((_d = this.errors.at(-1)) == null ? void 0 : _d.status) === 401;
+      if (this.diagnosticSequence === diagnosticsBefore) this.recordDiagnostic(diagnostic != null ? diagnostic : localFailure("sync", "local_operation_failed").diagnostic);
       try {
         await this.saveSync();
       } catch (e) {
       }
       this.updateStatus(true);
-      new import_obsidian.Notice(`${pairingRequired ? "Pairing required. Open Settings \u2192 Server Authority Sync \u2192 Advanced settings \u2192 Device pairing \u2192 Test and pair." : `Sync failed: ${safeError(error)}.`} ${this.diagnosticSummary()} State was retained.`, 15e3);
+      const heading = pairingRequired ? "Pairing required. Open Settings \u2192 Server Authority Sync \u2192 Advanced settings \u2192 Device pairing \u2192 Test and pair." : (diagnostic == null ? void 0 : diagnostic.reason) === "persistence_failure" ? "Sync blocked: credentials could not be stored or verified." : `Sync failed: ${safeError(error)}.`;
+      new import_obsidian.Notice(`${heading} ${this.diagnosticSummary()} State was retained.`, 15e3);
     } finally {
       this.syncing = false;
     }
@@ -1123,15 +1260,20 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     const credentials = config.setup_token ? await new RequestUrlTransport(next).redeemSetup(config.setup_token) : void 0;
     if (credentials && (!validSession(credentials) || !credentials.device_token)) throw new Error("Invalid pairing session");
     this.settings = next;
-    this.clearCredentials();
-    this.pairingStatus = { kind: "not-paired" };
     if (credentials) {
+      this.clearCredentials();
       this.deviceToken = credentials.device_token;
       this.session = { ticket: credentials.ticket, expires_at: credentials.expires_at };
       this.credentialBinding = this.binding();
-      this.pairingStatus = { kind: "ready" };
+      this.pairingStatus = { kind: "saving" };
+    } else {
+      this.pairingStatus = this.derivedStatus();
     }
     await this.saveSettings();
+    if (credentials) {
+      this.pairingStatus = { kind: "ready" };
+      await this.saveSettings();
+    }
   }
   async importSetupUri(params) {
     try {
@@ -1203,8 +1345,15 @@ var AuthoritySettingTab = class extends import_obsidian.PluginSettingTab {
     const advanced = containerEl.createEl("details", { cls: "server-authority-advanced-settings" });
     advanced.createEl("summary", { text: "Advanced settings (server, pairing, automation, AI)" });
     const advancedEl = advanced.createEl("div");
+    const saved = async (save) => {
+      try {
+        await save();
+      } catch (error) {
+        new import_obsidian.Notice(safeError(error));
+      }
+    };
     const text = (name, value, save, desc) => new import_obsidian.Setting(advancedEl).setName(name).setDesc(desc != null ? desc : "").addText((t) => t.setValue(value).onChange(async (value2) => {
-      await save(value2.trim());
+      await saved(() => save(value2.trim()));
     }));
     text("Server URL", this.plugin.settings.serverUrl, async (value) => {
       this.plugin.settings.serverUrl = value;
@@ -1236,12 +1385,12 @@ var AuthoritySettingTab = class extends import_obsidian.PluginSettingTab {
       const number = Number(value);
       if (Number.isInteger(number) && number >= 0 && number <= 1440) {
         this.plugin.settings.autoCheckIntervalMinutes = number;
-        await this.plugin.saveSettings();
+        await saved(() => this.plugin.saveSettings());
       }
     }));
     new import_obsidian.Setting(advancedEl).setName("Sync policy").addDropdown((d) => d.addOption("manual", "Manual").addOption("pull-when-clean", "Pull when clean").setValue(this.plugin.settings.syncPolicy).onChange(async (value) => {
       this.plugin.settings.syncPolicy = value;
-      await this.plugin.saveSettings();
+      await saved(() => this.plugin.saveSettings());
     }));
     advancedEl.createEl("h3", { text: "AI provider (optional, no credentials)" });
     text("Provider", this.plugin.settings.aiProvider.provider, async (value) => {
