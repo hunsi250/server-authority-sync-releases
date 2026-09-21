@@ -139,6 +139,9 @@ function validSession(value) {
   const session = value;
   return !!session && typeof session.ticket === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(session.ticket) && Date.parse(session.expires_at) > Date.now();
 }
+function shouldRenewSession(session, deviceToken) {
+  return typeof deviceToken === "string" && deviceToken.length > 0 && !validSession(session);
+}
 async function pairDevice(transport, identity, save, pending, wait = () => new Promise((resolve) => setTimeout(resolve, 2e3)), active = () => true) {
   validateServerFingerprint(identity.server_fingerprint);
   const health = await transport.health();
@@ -361,12 +364,34 @@ function waitMs(ms) {
   return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 }
 var RequestUrlTransport = class {
-  constructor(settings, session, enrollment) {
+  constructor(settings, session, enrollment, deviceToken = "", saveSession) {
     this.settings = settings;
     this.session = session;
     this.enrollment = enrollment;
+    this.deviceToken = deviceToken;
+    this.saveSession = saveSession;
+    __publicField(this, "renewal");
   }
-  async request(method, path, body, authenticated = false) {
+  renewSession() {
+    if (!this.renewal) this.renewal = this.performRenewal().finally(() => {
+      this.renewal = void 0;
+    });
+    return this.renewal;
+  }
+  async performRenewal() {
+    var _a;
+    if (!this.deviceToken) throw new Error("Session expired or unavailable. Test and pair again.");
+    let renewed;
+    try {
+      renewed = await this.request("POST", "/enrollments/session", { device_token: this.deviceToken });
+    } catch (e) {
+      throw new Error("Session expired or revoked. Test and pair again.");
+    }
+    if (!validSession(renewed)) throw new Error("Server returned an invalid session. Test and pair again.");
+    this.session = renewed;
+    await ((_a = this.saveSession) == null ? void 0 : _a.call(this, renewed));
+  }
+  async request(method, path, body, authenticated = false, retried = false) {
     var _a;
     if (authenticated) {
       if (this.enrollment) {
@@ -376,6 +401,7 @@ var RequestUrlTransport = class {
         path = `/enrollments/${encodeURIComponent(this.enrollment.request_id)}/poll`;
         body = { protocol_version: PROTOCOL_VERSION, vault_id: this.settings.vaultId, server_fingerprint: this.settings.serverFingerprint, poll_secret: this.enrollment.poll_secret, operation };
       } else {
+        if (shouldRenewSession(this.session, this.deviceToken)) await this.renewSession();
         if (!validSession(this.session)) throw new Error("Session expired or unavailable. Test and pair again.");
         body = { ...body, ticket: this.session.ticket };
       }
@@ -395,7 +421,14 @@ var RequestUrlTransport = class {
     }
     if (authenticated && response.status === 401) {
       this.session = void 0;
-      if (this.enrollment) this.enrollment = { ...this.enrollment, expires_at: "" };
+      if (this.enrollment) {
+        this.enrollment.expires_at = "";
+        throw new Error("Session expired or revoked. Test and pair again.");
+      }
+      if (!retried && this.deviceToken) {
+        await this.renewSession();
+        return this.request(method, path, body, authenticated, true);
+      }
       throw new Error("Session expired or revoked. Test and pair again.");
     }
     if (response.status < 200 || response.status >= 300) {
@@ -563,7 +596,10 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   }
   transport() {
     if (!this.settings.serverUrl) throw new Error("Set a server URL first");
-    return new RequestUrlTransport(this.settings, this.session, this.enrollment);
+    return new RequestUrlTransport(this.settings, this.session, this.enrollment, this.deviceToken, async (session) => {
+      this.session = session;
+      if (typeof this.saveData === "function") await this.saveSettings();
+    });
   }
   included(file) {
     return !this.isLocalPluginPath(file.path) && !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/workspace`) && !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/cache/`) && !file.path.endsWith("/.authority.sqlite3") && file.path !== ".authority.sqlite3";
