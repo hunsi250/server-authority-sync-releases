@@ -924,7 +924,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       } catch (e) {
       }
       this.updateStatus(true);
-      new import_obsidian.Notice(`Sync failed: ${safeError(error)}. ${pairingRequired ? "Pair again before retrying. " : ""}${this.diagnosticSummary()} State was retained.`, 15e3);
+      new import_obsidian.Notice(`${pairingRequired ? "Pairing required. Open Settings \u2192 Server Authority Sync \u2192 Advanced settings \u2192 Device pairing \u2192 Test and pair." : `Sync failed: ${safeError(error)}.`} ${this.diagnosticSummary()} State was retained.`, 15e3);
     } finally {
       this.syncing = false;
     }
