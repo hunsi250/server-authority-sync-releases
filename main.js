@@ -104,9 +104,10 @@ function planSync(state, local, server, localKinds = {}, serverKinds = {}, block
   const deletedBasePaths = Object.keys(state.files).filter((path) => !Object.prototype.hasOwnProperty.call(local, path) && !Object.prototype.hasOwnProperty.call(server, path));
   const serverAdded = Object.keys(server).filter((path) => !state.files[path]);
   const renameLike = deletedBasePaths.length > 0 && deletedBasePaths.length === localAdded.length && serverAdded.length === 0;
+  const blockedPrefixes = [...blocked];
   return [...paths].sort().map((path) => {
     var _a, _b, _c, _d, _e, _f;
-    if (blocked.has(path)) return { kind: "blocked", path, reason: "server-cannot-read" };
+    if (blockedPrefixes.some((entry) => entry === path || path.startsWith(entry + "/"))) return { kind: "blocked", path, reason: "server-cannot-read" };
     const base = (_b = (_a = state.files[path]) == null ? void 0 : _a.baseHash) != null ? _b : null;
     const localHash = Object.prototype.hasOwnProperty.call(local, path) ? local[path] : null;
     const serverHash = (_d = (_c = server[path]) == null ? void 0 : _c.sha256) != null ? _d : null;
