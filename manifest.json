@@ -1,7 +1,7 @@
 {
   "id": "server-authority-sync",
   "name": "Server authority sync",
-  "version": "0.3.24",
+  "version": "0.3.25",
   "minAppVersion": "1.4.0",
   "description": "Connect an Obsidian vault to a server-authority sync service.",
   "author": "Server Authority Sync contributors",

@@ -912,13 +912,19 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       if (activeConflict) new import_obsidian.Notice("\u5F53\u524D\u7B14\u8BB0\u5B58\u5728\u672A\u89E3\u51B3\u51B2\u7A81\uFF1B\u672C\u5730\u5185\u5BB9\u672A\u88AB\u8986\u76D6\u3002");
       new import_obsidian.Notice(syncNotice(decisions, reviews, [], manifest.files.length));
     } catch (error) {
+      const pairingRequired = error instanceof Error && /^(Enrollment session expired|Session expired or unavailable)/.test(error.message);
+      if (pairingRequired) {
+        this.clearCredentials();
+        this.pairingStatus = { kind: "not-paired" };
+        await this.saveSettings().catch(() => void 0);
+      }
       if (this.diagnosticSequence === diagnosticsBefore) this.recordDiagnostic({ stage: "local", retryCount: 0, retryable: false });
       try {
         await this.saveSync();
       } catch (e) {
       }
       this.updateStatus(true);
-      new import_obsidian.Notice(`Sync failed: ${safeError(error)}. ${this.diagnosticSummary()} State was retained.`, 15e3);
+      new import_obsidian.Notice(`Sync failed: ${safeError(error)}. ${pairingRequired ? "Pair again before retrying. " : ""}${this.diagnosticSummary()} State was retained.`, 15e3);
     } finally {
       this.syncing = false;
     }
