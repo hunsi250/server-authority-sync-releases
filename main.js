@@ -365,8 +365,11 @@ function userFacingServerError(status, payload) {
   if (status >= 400 && status < 500) return "\u8BF7\u6C42\u672A\u88AB\u63A5\u53D7\uFF0C\u8BF7\u68C0\u67E5\u5E76\u91CD\u5EFA\u63D0\u4EA4\u3002";
   return "\u670D\u52A1\u5668\u8FDE\u63A5\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002";
 }
-function safeError(_error) {
-  return "Operation failed. Check diagnostics, connection and pairing; retry after resolving the problem";
+function safeError(error) {
+  if (!(error instanceof Error)) return "Operation failed. Check diagnostics, connection and pairing; retry after resolving the problem";
+  const message = error.message;
+  const safe = /^(Set a server URL first|unsupported protocol version|Server identity does not match settings|Credential storage failed(?:\.|$)|Session expired or unavailable\. Test and pair again\.|Enrollment session expired\. Test and pair again\.|Server returned an invalid session\. Test and pair again\.|Pairing cancelled: settings changed\.|Unable to save pairing\.)$/i;
+  return safe.test(message) ? message : "Operation failed. Check diagnostics, connection and pairing; retry after resolving the problem";
 }
 var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted"]);
 function normalizeDiagnostics(value) {
@@ -538,10 +541,12 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     __publicField(this, "errors", []);
+    __publicField(this, "diagnosticSequence", 0);
     __publicField(this, "credentialBinding");
     __publicField(this, "credentialsSaved");
     __publicField(this, "recordDiagnostic", (diagnostic) => {
       this.errors = [...this.errors.slice(-19), diagnostic];
+      this.diagnosticSequence++;
       this.updateStatus();
     });
     __publicField(this, "pairing", false);
@@ -856,6 +861,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       return;
     }
     this.syncing = true;
+    const diagnosticsBefore = this.diagnosticSequence;
     try {
       const transport = this.transport();
       const manifest = await transport.manifest();
@@ -901,6 +907,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       if (activeConflict) new import_obsidian.Notice("\u5F53\u524D\u7B14\u8BB0\u5B58\u5728\u672A\u89E3\u51B3\u51B2\u7A81\uFF1B\u672C\u5730\u5185\u5BB9\u672A\u88AB\u8986\u76D6\u3002");
       new import_obsidian.Notice(syncNotice(decisions, reviews, [], manifest.files.length));
     } catch (error) {
+      if (this.diagnosticSequence === diagnosticsBefore) this.recordDiagnostic({ stage: "local", retryCount: 0, retryable: false });
       try {
         await this.saveSync();
       } catch (e) {
