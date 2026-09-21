@@ -401,17 +401,21 @@ var RequestUrlTransport = class {
     return this.renewal;
   }
   async performRenewal() {
-    var _a;
+    var _a, _b;
     if (!this.deviceToken) throw new Error("Session expired or unavailable. Test and pair again.");
     let renewed;
     try {
       renewed = await this.request("POST", "/enrollments/session", { device_token: this.deviceToken });
-    } catch (e) {
-      throw new Error("Session expired or revoked. Test and pair again.");
+    } catch (error) {
+      const details = error && typeof error === "object" ? error : {};
+      const diagnostic = (_a = details.diagnostic) != null ? _a : details;
+      const status = diagnostic.status ? `HTTP ${diagnostic.status}` : "network/response error";
+      const code = diagnostic.code ? `, code ${diagnostic.code}` : "";
+      throw new Error(`Session renewal failed (${status}${code}). Test and pair again.`);
     }
     if (!validSession(renewed)) throw new Error("Server returned an invalid session. Test and pair again.");
     this.session = renewed;
-    await ((_a = this.saveSession) == null ? void 0 : _a.call(this, renewed));
+    await ((_b = this.saveSession) == null ? void 0 : _b.call(this, renewed));
   }
   async request(method, path, body, authenticated = false, retried = false) {
     if (this.credentialsSaved && !await this.credentialsSaved) throw new Error("Credential storage failed. Test and pair again.");
