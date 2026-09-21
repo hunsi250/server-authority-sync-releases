@@ -325,9 +325,6 @@ function validateSetupConfig(input) {
   if (v.auto_check_interval_minutes !== void 0 && (!Number.isInteger(v.auto_check_interval_minutes) || v.auto_check_interval_minutes < 0 || v.auto_check_interval_minutes > 1440)) throw new Error("invalid check interval");
   return v;
 }
-function segmentPath(path) {
-  return validateRelativePath(path).split("/").map(encodeURIComponent).join("/");
-}
 function joinUrl(base, prefix, path) {
   return `${base}${prefix}${path}`;
 }
@@ -371,6 +368,15 @@ function userFacingServerError(status, payload) {
       return "\u670D\u52A1\u5668\u6587\u4EF6\u4E0D\u5B58\u5728\uFF0C\u8BF7\u5237\u65B0\u3002";
     case "rate_limited":
       return "\u8BF7\u6C42\u8FC7\u4E8E\u9891\u7E41\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002";
+    case "vault_unreadable":
+      return "\u670D\u52A1\u5668\u65E0\u6CD5\u8BFB\u53D6\u5176 Vault \u4E2D\u7684\u6587\u4EF6\uFF08\u670D\u52A1\u5668\u7AEF\u6743\u9650\u95EE\u9898\uFF09\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u4FEE\u590D\uFF1B\u4F60\u7684\u914D\u5BF9\u4E0E\u51ED\u636E\u4E0D\u53D7\u5F71\u54CD\u3002";
+    case "identity_mismatch":
+      return "\u670D\u52A1\u5668\u8EAB\u4EFD\u4E0E\u8BBE\u7F6E\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u68C0\u67E5 Vault ID \u4E0E\u6307\u7EB9\u3002";
+    case "request_too_large":
+    case "file_too_large":
+      return "\u8BF7\u6C42\u6216\u6587\u4EF6\u8FC7\u5927\uFF0C\u8BF7\u62C6\u5206\u540E\u91CD\u8BD5\u3002";
+    case "internal_error":
+      return "\u670D\u52A1\u5668\u5185\u90E8\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF1B\u8FD9\u4E0D\u4F1A\u4F7F\u914D\u5BF9\u5931\u6548\u3002";
   }
   if (status === 401 || status === 403) return "\u4F1A\u8BDD\u5DF2\u8FC7\u671F\u6216\u672A\u6388\u6743\uFF0C\u8BF7\u91CD\u65B0\u914D\u5BF9\u3002";
   if (status === 404) return "\u670D\u52A1\u5668\u8D44\u6E90\u4E0D\u5B58\u5728\uFF0C\u8BF7\u5237\u65B0\u3002";
@@ -381,7 +387,8 @@ function userFacingServerError(status, payload) {
 function safeError(error) {
   var _a;
   if (!(error instanceof Error)) return "Operation failed. Check diagnostics, connection and pairing; retry after resolving the problem";
-  if (error.intermediary) return "The edge or proxy rejected the request with HTTP 401 and no server error envelope; saved credentials were kept";
+  if (error.intermediary) return "The server answered HTTP 401 without an authentication error code; a proxy, edge rule or server fault rejected the request. Saved credentials were kept.";
+  if (error.safeMessage) return error.message;
   const reason = (_a = error.diagnostic) == null ? void 0 : _a.reason;
   if (reason && reason in LOCAL_REASONS) return LOCAL_REASONS[reason];
   const message = error.message;
@@ -400,7 +407,7 @@ var LOCAL_REASONS = {
 function localFailure(stage, reason, requestSent = false) {
   return Object.assign(new Error(LOCAL_REASONS[reason]), { diagnostic: { stage, reason, retryCount: 0, retryable: false, requestSent } });
 }
-var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted", "invalid_response"]);
+var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted", "invalid_response", "vault_unreadable", "internal_error", "request_too_large", "file_too_large", "identity_mismatch"]);
 function normalizeDiagnostics(value) {
   if (!Array.isArray(value)) return [];
   return value.filter((item) => {
@@ -415,16 +422,18 @@ function requestStage(path) {
   if (path === "/enrollments") return "create-enrollment";
   if (path.endsWith("/poll")) return "poll";
   if (path.endsWith("/manifest")) return "manifest";
-  if (path.includes("/files/")) return "file";
+  if (path.includes("/files/") || path.endsWith("/read")) return "file";
   if (path === "/submissions") return "submit";
   return path === "/enrollments/session" ? "session" : path === "/submissions/list" ? "submissions" : "setup";
 }
 function waitMs(ms) {
   return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
 }
-function apiErrorEnvelope(payload) {
+var AUTHENTICATION_CODES = /* @__PURE__ */ new Set(["unauthorized", "session_expired"]);
+function authenticationRefusal(payload) {
   var _a;
-  return !!payload && typeof payload === "object" && typeof ((_a = payload.error) == null ? void 0 : _a.code) === "string";
+  const code = (_a = payload == null ? void 0 : payload.error) == null ? void 0 : _a.code;
+  return typeof code === "string" && AUTHENTICATION_CODES.has(code);
 }
 var RequestUrlTransport = class {
   constructor(settings, session, enrollment, deviceToken = "", saveSession, recordDiagnostic, discardEnrollment, unauthorized, onRequest) {
@@ -500,10 +509,10 @@ var RequestUrlTransport = class {
         if (id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) requestId = id;
       } catch (e) {
       }
-      const intermediary = status === 401 && !apiErrorEnvelope(payload2);
+      const intermediary = status === 401 && !authenticationRefusal(payload2);
       const diagnostic = { stage, status, code, requestId, retryCount: retried ? 1 : 0, retryable: status === void 0 || status === 408 || status === 429 || status >= 500, intermediary };
       (_c2 = this.recordDiagnostic) == null ? void 0 : _c2.call(this, diagnostic);
-      return Object.assign(new Error(message), { status, code, diagnostic, authority: apiErrorEnvelope(payload2) && !intermediary, intermediary });
+      return Object.assign(new Error(message), { status, code, diagnostic, authority: authenticationRefusal(payload2), intermediary });
     };
     if (authenticated) {
       if (this.enrollment && !validEnrollment(this.enrollment)) {
@@ -512,7 +521,8 @@ var RequestUrlTransport = class {
       }
       if (this.enrollment) {
         const vault = `/vaults/${encodeURIComponent(this.settings.vaultId)}`;
-        const operation = path === `${vault}/manifest` ? { type: "manifest" } : path.startsWith(`${vault}/files/`) ? { type: "read-file", path: decodeURIComponent(path.slice(`${vault}/files/`.length)) } : path === "/submissions/list" ? { type: "list-submissions" } : { type: "submit", submission: body };
+        const readPath = body == null ? void 0 : body.path;
+        const operation = path === `${vault}/manifest` ? { type: "manifest" } : path.startsWith(`${vault}/files/`) ? { type: "read-file", path: decodeURIComponent(path.slice(`${vault}/files/`.length)) } : path === `${vault}/read` && typeof readPath === "string" ? { type: "read-file", path: readPath } : path === "/submissions/list" ? { type: "list-submissions" } : { type: "submit", submission: body };
         path = `/enrollments/${encodeURIComponent(this.enrollment.request_id)}/poll`;
         body = { protocol_version: PROTOCOL_VERSION, vault_id: this.settings.vaultId, server_fingerprint: this.settings.serverFingerprint, poll_secret: this.enrollment.poll_secret, operation };
       } else {
@@ -542,9 +552,9 @@ var RequestUrlTransport = class {
       if (response.status !== 401) throw failure("Invalid server response", response.status, void 0, response.headers);
     }
     if (authenticated && response.status === 401) {
-      if (!apiErrorEnvelope(payload)) {
-        const intermediary = failure("Rejected with HTTP 401 without an API error envelope; a proxy or edge rule may be blocking the request. Credentials were kept.", response.status, payload, response.headers);
-        throw intermediary;
+      if (!authenticationRefusal(payload)) {
+        const kept = failure("Rejected with HTTP 401 without an authentication error code; a proxy or edge rule is involved, or the server has a fault. Credentials were kept.", response.status, payload, response.headers);
+        throw kept;
       }
       const error = failure("Authentication rejected. Test and pair again if renewal is unauthorized.", response.status, payload, response.headers);
       this.session = void 0;
@@ -567,7 +577,9 @@ var RequestUrlTransport = class {
       } catch (e) {
         message = userFacingServerError(response.status, void 0);
       }
-      throw failure(message, response.status, payload, response.headers);
+      const rejected = failure(message, response.status, payload, response.headers);
+      rejected.safeMessage = true;
+      throw rejected;
     }
     return payload;
   }
@@ -587,7 +599,7 @@ var RequestUrlTransport = class {
     return this.request("POST", `/vaults/${encodeURIComponent(this.settings.vaultId)}/manifest`, void 0, true);
   }
   readFile(path) {
-    return this.request("POST", `/vaults/${encodeURIComponent(this.settings.vaultId)}/files/${segmentPath(path)}`, void 0, true);
+    return this.request("POST", `/vaults/${encodeURIComponent(this.settings.vaultId)}/read`, { path: validateRelativePath(path) }, true);
   }
   submit(value) {
     return this.request("POST", "/submissions", { protocol_version: PROTOCOL_VERSION, submission_id: value.submissionId, base_revision_id: value.baseRevisionId, changes: value.changes, created_at: value.createdAt }, true);
@@ -649,7 +661,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     var _a, _b, _c, _d, _e, _f, _g;
     const d = this.errors[this.errors.length - 1];
     if (!d) return "No request failures recorded.";
-    if (d.intermediary) return `Plugin ${(_b = (_a = this.manifest) == null ? void 0 : _a.version) != null ? _b : "unknown"} \xB7 Stage: ${d.stage} \xB7 HTTP: ${(_c = d.status) != null ? _c : "401"} without an API error envelope: something other than the server rejected the request, so it was not treated as an authentication failure. Credentials were kept; check the reverse proxy or edge rule for this route.`;
+    if (d.intermediary) return `Plugin ${(_b = (_a = this.manifest) == null ? void 0 : _a.version) != null ? _b : "unknown"} \xB7 Stage: ${d.stage} \xB7 HTTP: ${(_c = d.status) != null ? _c : "401"} without an authentication error code: something other than an authentication decision rejected the request, so it was not treated as an authentication failure. Credentials were kept; check the reverse proxy, edge rule or a server fault for this route.`;
     const recovery = d.status === 401 ? " Authentication rejected; automatic recovery was attempted. If still unpaired, Test and pair." : d.retryable ? " Check connection and retry." : " Check settings and retry.";
     const local = (text) => d.requestSent === true ? `A response was received for this stage, then local processing failed: ${text}` : d.requestSent === false ? `No HTTP request was made for this stage: ${text}` : `Local failure during this stage: ${text}`;
     const detail = d.reason ? local(LOCAL_REASONS[d.reason]) : d.status === void 0 ? d.code === "invalid_response" ? "The server answered, but the response was not usable and no HTTP status was recorded." : "No HTTP response was recorded for this stage: the connection failed before a response arrived." : `HTTP: ${d.status} \xB7 Code: ${(_d = d.code) != null ? _d : "not supplied"} \xB7 Request ID: ${(_e = d.requestId) != null ? _e : "not supplied"}.${recovery}`;
