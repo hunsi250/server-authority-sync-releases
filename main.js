@@ -618,6 +618,10 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       this.settings.syncPolicy = "manual";
       await this.saveSettings();
     }
+    if (this.pairingStatus.kind === "ready" && !this.deviceToken && !this.session && !this.enrollment) {
+      this.pairingStatus = { kind: "not-paired" };
+      await this.saveSettings();
+    }
     this.statusBar = this.addStatusBarItem();
     this.updateStatus();
     this.addSettingTab(new AuthoritySettingTab(this.app, this));
