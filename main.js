@@ -1107,7 +1107,34 @@ var AuthoritySettingTab = class extends import_obsidian.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "Server authority sync" });
-    const text = (name, value, save, desc) => new import_obsidian.Setting(containerEl).setName(name).setDesc(desc != null ? desc : "").addText((t) => t.setValue(value).onChange(async (value2) => {
+    const status = new import_obsidian.Setting(containerEl).setName("Current status").setDesc(`${pairingStatusLabel(this.plugin.pairingStatus)} \xB7 ${this.plugin.syncing ? "Syncing" : this.plugin.submitting ? "Submitting pending changes" : "Ready for commands"}`);
+    status.addButton((b) => b.setButtonText(this.plugin.syncing ? "Syncing\u2026" : "Sync with server").setDisabled(this.plugin.syncing).onClick(async () => {
+      b.setDisabled(true);
+      try {
+        await this.plugin.syncWithServer();
+      } finally {
+        b.setDisabled(false);
+        this.display();
+      }
+    }));
+    status.addButton((b) => b.setButtonText("Submit pending changes").setDisabled(this.plugin.submitting).onClick(async () => {
+      b.setDisabled(true);
+      try {
+        await this.plugin.submitPendingChanges();
+      } finally {
+        b.setDisabled(false);
+        this.display();
+      }
+    }));
+    applyActionRowLayout(status.controlEl);
+    const common = new import_obsidian.Setting(containerEl).setName("Common actions").setDesc("Use these commands for normal synchronization. Server and pairing settings are under Advanced settings.");
+    common.addButton((b) => b.setButtonText("Open conflicts").onClick(() => void this.plugin.openConflicts()));
+    common.addButton((b) => b.setButtonText("Pending submissions").onClick(() => void this.plugin.openPendingSubmissions()));
+    applyActionRowLayout(common.controlEl);
+    const advanced = containerEl.createEl("details", { cls: "server-authority-advanced-settings" });
+    advanced.createEl("summary", { text: "Advanced settings (server, pairing, automation, AI)" });
+    const advancedEl = advanced.createEl("div");
+    const text = (name, value, save, desc) => new import_obsidian.Setting(advancedEl).setName(name).setDesc(desc != null ? desc : "").addText((t) => t.setValue(value).onChange(async (value2) => {
       await save(value2.trim());
     }));
     text("Server URL", this.plugin.settings.serverUrl, async (value) => {
@@ -1130,24 +1157,24 @@ var AuthoritySettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.serverFingerprint = value;
       await this.plugin.saveSettings();
     }, "Required for automatic pairing. Obtain the exact public fingerprint from your administrator.");
-    const pairing = new import_obsidian.Setting(containerEl).setName("Device pairing").setDesc(`${pairingStatusLabel(this.plugin.pairingStatus)}. Credentials are stored only in plugin data.`).addButton((b) => b.setButtonText(this.plugin.pairing ? "Pairing\u2026" : "Test and pair").setDisabled(this.plugin.pairing).onClick(async () => {
+    const pairing = new import_obsidian.Setting(advancedEl).setName("Device pairing").setDesc(`${pairingStatusLabel(this.plugin.pairingStatus)}. Credentials are stored only in plugin data.`).addButton((b) => b.setButtonText(this.plugin.pairing ? "Pairing\u2026" : "Test and pair").setDisabled(this.plugin.pairing).onClick(async () => {
       b.setDisabled(true);
       await this.plugin.testAndPair();
       this.display();
     }));
     applyActionRowLayout(pairing.controlEl);
-    new import_obsidian.Setting(containerEl).setName("Automatic check interval (minutes)").addText((t) => t.setValue(String(this.plugin.settings.autoCheckIntervalMinutes)).onChange(async (value) => {
+    new import_obsidian.Setting(advancedEl).setName("Automatic check interval (minutes)").addText((t) => t.setValue(String(this.plugin.settings.autoCheckIntervalMinutes)).onChange(async (value) => {
       const number = Number(value);
       if (Number.isInteger(number) && number >= 0 && number <= 1440) {
         this.plugin.settings.autoCheckIntervalMinutes = number;
         await this.plugin.saveSettings();
       }
     }));
-    new import_obsidian.Setting(containerEl).setName("Sync policy").addDropdown((d) => d.addOption("manual", "Manual").addOption("pull-when-clean", "Pull when clean").setValue(this.plugin.settings.syncPolicy).onChange(async (value) => {
+    new import_obsidian.Setting(advancedEl).setName("Sync policy").addDropdown((d) => d.addOption("manual", "Manual").addOption("pull-when-clean", "Pull when clean").setValue(this.plugin.settings.syncPolicy).onChange(async (value) => {
       this.plugin.settings.syncPolicy = value;
       await this.plugin.saveSettings();
     }));
-    containerEl.createEl("h3", { text: "AI provider (optional, no credentials)" });
+    advancedEl.createEl("h3", { text: "AI provider (optional, no credentials)" });
     text("Provider", this.plugin.settings.aiProvider.provider, async (value) => {
       this.plugin.settings.aiProvider.provider = value;
       await this.plugin.saveSettings();
@@ -1160,17 +1187,10 @@ var AuthoritySettingTab = class extends import_obsidian.PluginSettingTab {
       this.plugin.settings.aiProvider.endpoint = value;
       await this.plugin.saveSettings();
     });
-    const actions = new import_obsidian.Setting(containerEl).setName("Actions").addButton((b) => b.setButtonText(this.plugin.syncing ? "Syncing\u2026" : "Sync with server").setDisabled(this.plugin.syncing).onClick(async () => {
-      b.setDisabled(true);
-      await this.plugin.syncWithServer();
-      this.display();
-    })).addButton((b) => b.setButtonText("Copy configuration link").onClick(() => void this.plugin.exportConfiguration())).addButton((b) => b.setButtonText("Paste setup/config link").onClick(() => void this.plugin.importSetupConfiguration())).addButton((b) => b.setButtonText("Open conflicts").onClick(() => void this.plugin.openConflicts())).addButton((b) => b.setButtonText("Pending submissions").onClick(() => void this.plugin.openPendingSubmissions()));
-    actions.addButton((b) => b.setButtonText("Submit pending changes").setDisabled(this.plugin.submitting).onClick(() => void this.plugin.submitPendingChanges()));
-    actions.addButton((b) => b.setButtonText("Reset pairing state").setDisabled(this.plugin.pairing).onClick(async () => {
+    const actions = new import_obsidian.Setting(advancedEl).setName("Advanced actions").addButton((b) => b.setButtonText("Copy configuration link").onClick(() => void this.plugin.exportConfiguration())).addButton((b) => b.setButtonText("Paste setup/config link").onClick(() => void this.plugin.importSetupConfiguration())).addButton((b) => b.setButtonText("Reset pairing state").setDisabled(this.plugin.pairing).onClick(async () => {
       await this.plugin.resetPairingState();
       this.display();
-    }));
-    actions.addButton((b) => b.setButtonText("Copy diagnostics").onClick(() => void this.plugin.copyDiagnostics()));
+    })).addButton((b) => b.setButtonText("Copy diagnostics").onClick(() => void this.plugin.copyDiagnostics()));
     applyActionRowLayout(actions.controlEl);
   }
 };
