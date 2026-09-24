@@ -129,7 +129,10 @@ function planSync(state, local, server, localKinds = {}, serverKinds = {}, block
       return { kind: "submit", path, localHash, operation: "write", reason: "local-addition-pending" };
     }
     if (localHash === base) return { kind: "pull", path, serverHash };
-    if (serverHash === base) return { kind: "submit", path, localHash, operation: localHash === null ? "delete" : "write", reason: localHash === null ? "local-deletion-review" : void 0 };
+    if (serverHash === base) {
+      if (localHash === null) return { kind: "pull", path, serverHash };
+      return { kind: "submit", path, localHash, operation: "write" };
+    }
     if (!state.files[path] && serverHash !== null && localHash !== null) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "simultaneous-add-review" };
     return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "simultaneous-edit-review" };
   });
