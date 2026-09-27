@@ -80,17 +80,20 @@ function createPendingSubmission(baseRevisionId, changes) {
   return { submissionId: crypto.randomUUID(), baseRevisionId, changes, createdAt: (/* @__PURE__ */ new Date()).toISOString(), retryCount: 0 };
 }
 function emptySyncState() {
-  return { version: SYNC_STATE_VERSION, serverRevision: null, files: {}, pendingSubmissions: [], conflicts: [] };
+  return { version: SYNC_STATE_VERSION, serverRevision: null, files: {}, excludedFiles: {}, pendingSubmissions: [], conflicts: [], overwriteBackups: [] };
 }
 function normalizeSyncState(value) {
-  var _a;
+  var _a, _b;
   if (!value || typeof value !== "object") return emptySyncState();
   const input = value;
   const files = {};
   for (const [path, entry] of Object.entries((_a = input.files) != null ? _a : {})) {
-    if (entry && (typeof entry.baseHash === "string" || entry.baseHash === null)) files[path] = { baseHash: entry.baseHash };
+    if (entry && (typeof entry.baseHash === "string" || entry.baseHash === null)) files[path] = { baseHash: entry.baseHash, ...typeof entry.localHash === "string" || entry.localHash === null ? { localHash: entry.localHash } : {}, ...typeof entry.localSize === "number" ? { localSize: entry.localSize } : {}, ...typeof entry.localMtime === "number" ? { localMtime: entry.localMtime } : {} };
   }
-  return { version: SYNC_STATE_VERSION, serverRevision: typeof input.serverRevision === "string" ? input.serverRevision : null, files, pendingSubmissions: Array.isArray(input.pendingSubmissions) ? input.pendingSubmissions : [], conflicts: Array.isArray(input.conflicts) ? input.conflicts : [] };
+  const excludedFiles = {};
+  for (const [path, entry] of Object.entries((_b = input.excludedFiles) != null ? _b : {})) if (entry && typeof entry.serverHash === "string" && typeof entry.size === "number" && entry.reason === "file-too-large") excludedFiles[path] = entry;
+  const overwriteBackups = Array.isArray(input.overwriteBackups) ? input.overwriteBackups.filter((item) => item && typeof item.path === "string" && typeof item.localHash === "string" && typeof item.serverHash === "string" && typeof item.serverRevisionId === "string" && typeof item.cachePath === "string" && typeof item.cacheHash === "string" && typeof item.createdAt === "string") : [];
+  return { version: SYNC_STATE_VERSION, serverRevision: typeof input.serverRevision === "string" ? input.serverRevision : null, files, excludedFiles, pendingSubmissions: Array.isArray(input.pendingSubmissions) ? input.pendingSubmissions : [], conflicts: Array.isArray(input.conflicts) ? input.conflicts : [], overwriteBackups };
 }
 function isLocalClean(state, local) {
   return [.../* @__PURE__ */ new Set([...Object.keys(local), ...Object.keys(state.files)])].every((path) => {
@@ -98,7 +101,8 @@ function isLocalClean(state, local) {
     return ((_a = local[path]) != null ? _a : null) === ((_c = (_b = state.files[path]) == null ? void 0 : _b.baseHash) != null ? _c : null);
   });
 }
-function planSync(state, local, server, localKinds = {}, serverKinds = {}, blocked = /* @__PURE__ */ new Set()) {
+var MAX_SYNC_FILE_BYTES = 16 * 1024 * 1024;
+function planSync(state, local, server, localKinds = {}, serverKinds = {}, blocked = /* @__PURE__ */ new Set(), options = { allowLocalSubmissions: false }) {
   const paths = /* @__PURE__ */ new Set([...Object.keys(state.files), ...Object.keys(local), ...Object.keys(server), ...Object.keys(localKinds), ...Object.keys(serverKinds)]);
   const localAdded = Object.keys(local).filter((path) => !state.files[path]);
   const deletedBasePaths = Object.keys(state.files).filter((path) => !Object.prototype.hasOwnProperty.call(local, path) && !Object.prototype.hasOwnProperty.call(server, path));
@@ -106,13 +110,14 @@ function planSync(state, local, server, localKinds = {}, serverKinds = {}, block
   const renameLike = deletedBasePaths.length > 0 && deletedBasePaths.length === localAdded.length && serverAdded.length === 0;
   const blockedPrefixes = [...blocked];
   return [...paths].sort().map((path) => {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     if (blockedPrefixes.some((entry) => entry === path || path.startsWith(entry + "/"))) return { kind: "blocked", path, reason: "server-cannot-read" };
     const base = (_b = (_a = state.files[path]) == null ? void 0 : _a.baseHash) != null ? _b : null;
     const localHash = Object.prototype.hasOwnProperty.call(local, path) ? local[path] : null;
     const serverHash = (_d = (_c = server[path]) == null ? void 0 : _c.sha256) != null ? _d : null;
-    const localKind = (_e = localKinds[path]) != null ? _e : localHash !== null ? "file" : void 0;
-    const serverKind = (_f = serverKinds[path]) != null ? _f : serverHash !== null ? "file" : void 0;
+    if (server[path] && server[path].size > MAX_SYNC_FILE_BYTES && !((_e = options.retryExcluded) == null ? void 0 : _e.has(path))) return { kind: "excluded", path, serverHash: server[path].sha256, size: server[path].size, reason: ((_f = state.excludedFiles[path]) == null ? void 0 : _f.serverHash) === server[path].sha256 ? "file-too-large-cached" : "file-too-large" };
+    const localKind = (_g = localKinds[path]) != null ? _g : localHash !== null ? "file" : void 0;
+    const serverKind = (_h = serverKinds[path]) != null ? _h : serverHash !== null ? "file" : void 0;
     const collision = localKind && serverKind && localKind !== serverKind;
     const ancestorCollision = [.../* @__PURE__ */ new Set([...Object.keys(localKinds), ...Object.keys(serverKinds)])].some((parent) => {
       var _a2;
@@ -121,17 +126,19 @@ function planSync(state, local, server, localKinds = {}, serverKinds = {}, block
     if (collision || ancestorCollision) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "file-directory-collision" };
     if (serverHash === null && localHash !== null && base === localHash && state.files[path]) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: renameLike ? "rename-like-delete-review" : "server-deletion-retained-locally" };
     if (serverHash === null && localHash === null && state.files[path] && renameLike) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "rename-like-delete-review" };
+    if (state.files[path] && localHash === null && serverHash !== null) return { kind: "pull", path, serverHash };
     if (!state.files[path] && serverHash !== null && localHash === null) return { kind: "pull", path, serverHash };
     if (localHash === null && serverHash === null) return { kind: "clean", path, hash: null };
     if (localHash === serverHash) return { kind: "clean", path, hash: localHash };
     if (!state.files[path] && serverHash === null && localHash !== null) {
       if (renameLike) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "rename-like-add-review" };
-      return { kind: "submit", path, localHash, operation: "write", reason: "local-addition-pending" };
+      return options.allowLocalSubmissions ? { kind: "submit", path, localHash, operation: "write", reason: "local-addition-pending" } : { kind: "review", path, localHash, reason: "local-addition-explicit-selection-required" };
     }
     if (localHash === base) return { kind: "pull", path, serverHash };
+    if (options.allowLocalSubmissions === false && serverHash !== null && serverHash !== base) return { kind: "pull", path, serverHash, reason: "server-authoritative-overwrite" };
     if (serverHash === base) {
       if (localHash === null) return { kind: "pull", path, serverHash };
-      return { kind: "submit", path, localHash, operation: "write" };
+      return options.allowLocalSubmissions ? { kind: "submit", path, localHash, operation: "write" } : { kind: "review", path, localHash, reason: "local-change-explicit-selection-required" };
     }
     if (!state.files[path] && serverHash !== null && localHash !== null) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "simultaneous-add-review" };
     return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "simultaneous-edit-review" };
@@ -235,8 +242,9 @@ function classifySyncOutcome(input) {
   const clean = decisions.filter((d) => d.kind === "clean");
   const pending = decisions.filter((d) => d.kind === "submit");
   const conflicts = decisions.filter((d) => d.kind === "conflict");
+  const policyReviews = decisions.filter((d) => d.kind === "review");
   const blocked = decisions.filter((d) => d.kind === "blocked");
-  const reviewPaths = [.../* @__PURE__ */ new Set([...reviewTexts.map((text) => text.split(":", 1)[0]), ...conflicts.map((d) => d.path)])];
+  const reviewPaths = [.../* @__PURE__ */ new Set([...reviewTexts.map((text) => text.split(":", 1)[0]), ...conflicts.map((d) => d.path), ...policyReviews.map((d) => d.path)])];
   const retryableFailures = errors.filter((error) => {
     var _a2;
     return typeof error === "object" && error !== null && (error.retryable || [408, 429, 500, 502, 503, 504].includes((_a2 = error.status) != null ? _a2 : 0));
@@ -255,11 +263,14 @@ function listPaths(paths, limit = 3) {
 function syncNotice(decisions, reviews = [], errors = [], manifestFiles = decisions.length) {
   const outcome = classifySyncOutcome({ decisions, reviews, errors, manifestFiles });
   if (outcome.kind === "no-op") return "All files are up to date. No synchronization needed.";
-  const summary = `Sync complete: ${outcome.manifestFiles} manifest file(s); ${outcome.pulled} pulled/updated, ${outcome.skipped} already up to date, ${outcome.pendingChanges} pending local change(s) (${outcome.pendingAdditions} addition(s)), ${outcome.reviews} needs review.`;
+  const summary = `Sync complete: ${outcome.manifestFiles} manifest file(s); ${outcome.pulled} pulled/updated, ${outcome.skipped} already up to date, ${outcome.pendingChanges} pending local change(s) (${outcome.pendingAdditions} addition(s)), ${outcome.reviews} needs review.${outcome.paths.length ? ` Pulled paths: ${listPaths(outcome.paths)}.` : ""}`;
   const blocked = outcome.blocked ? ` ${outcome.blocked} file(s) the server cannot read, so they were not pulled: ${listPaths(outcome.blockedPaths)}. Nothing was deleted locally; ask the administrator to fix vault ownership/permissions.` : "";
   const reasons = errors.map((error) => error == null ? void 0 : error.message).filter((message) => !!message).slice(0, 2);
   const failures = errors.length ? ` Retryable failures: ${outcome.retryableFailures}; non-retryable failures: ${outcome.nonRetryableFailures}${outcome.failurePaths.length ? ` (${listPaths(outcome.failurePaths)})` : ""}.${reasons.length ? ` ${reasons.join(" ")}` : ""}` : "";
-  const detail = outcome.reviewPaths.length ? ` Review paths: ${outcome.reviewPaths.slice(0, 3).join("; ")}.` : "";
+  const detail = outcome.reviewPaths.length ? ` Review paths: ${outcome.reviewPaths.slice(0, 3).map((path) => {
+    var _a;
+    return (_a = reviews.find((text) => text.startsWith(`${path}:`))) != null ? _a : path;
+  }).join("; ")}.` : "";
   if (outcome.kind === "failed") return `Sync failed: ${outcome.nonRetryableFailures + outcome.retryableFailures} transport or file error(s). State was retained.`;
   return summary + blocked + failures + detail;
 }
@@ -302,7 +313,7 @@ function applyActionRowLayout(controlEl) {
 var PROTOCOL_VERSION = "1";
 var DEFAULT_API_PREFIX = "/api/v1";
 var CACHE_ROOT = ".obsidian/server-authority-sync";
-var DEFAULT_SETTINGS = { serverUrl: "", apiPrefix: DEFAULT_API_PREFIX, vaultId: "default", serverFingerprint: "", autoCheckIntervalMinutes: 30, syncPolicy: "manual", aiProvider: { provider: "", model: "", endpoint: "" } };
+var DEFAULT_SETTINGS = { serverUrl: "", apiPrefix: DEFAULT_API_PREFIX, vaultId: "default", serverFingerprint: "", autoCheckIntervalMinutes: 30, syncPolicy: "server-authoritative", aiProvider: { provider: "", model: "", endpoint: "" } };
 function mergeSettings(input) {
   var _a;
   return { ...DEFAULT_SETTINGS, ...input != null ? input : {}, aiProvider: { ...DEFAULT_SETTINGS.aiProvider, ...(_a = input == null ? void 0 : input.aiProvider) != null ? _a : {} } };
@@ -335,7 +346,7 @@ function validateSetupConfig(input) {
   if (v.api_prefix) validateApiPrefix(v.api_prefix);
   if (v.server_fingerprint !== void 0) validateServerFingerprint(v.server_fingerprint);
   if (v.setup_token !== void 0 && (!v.setup_token || typeof v.setup_token !== "string")) throw new Error("invalid setup token");
-  if (v.sync_policy && v.sync_policy !== "manual" && v.sync_policy !== "pull-when-clean") throw new Error("invalid sync policy");
+  if (v.sync_policy && v.sync_policy !== "manual" && v.sync_policy !== "pull-when-clean" && v.sync_policy !== "server-authoritative") throw new Error("invalid sync policy");
   if (v.auto_check_interval_minutes !== void 0 && (!Number.isInteger(v.auto_check_interval_minutes) || v.auto_check_interval_minutes < 0 || v.auto_check_interval_minutes > 1440)) throw new Error("invalid check interval");
   return v;
 }
@@ -657,9 +668,11 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "syncState", emptySyncState());
     __publicField(this, "statusBar");
     __publicField(this, "internalWrites", /* @__PURE__ */ new Set());
+    __publicField(this, "excludedRetries", /* @__PURE__ */ new Set());
     __publicField(this, "localDirty", false);
     __publicField(this, "statusListener");
     __publicField(this, "changeVersions", /* @__PURE__ */ new Map());
+    __publicField(this, "dirtyPaths", /* @__PURE__ */ new Set());
     __publicField(this, "storageFailed", false);
     __publicField(this, "requestsSent", 0);
     __publicField(this, "writes", Promise.resolve());
@@ -854,6 +867,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.changeVersions.set(file.path, ((_a = this.changeVersions.get(file.path)) != null ? _a : 0) + 1);
     if (this.internalWrites.delete(file.path)) return;
     if (!this.isLocalPluginPath(file.path)) {
+      this.dirtyPaths.add(file.path);
       this.localDirty = true;
       this.updateStatus();
     }
@@ -969,9 +983,19 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   included(file) {
     return !this.isLocalPluginPath(file.path) && !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/workspace`) && !file.path.startsWith(`${this.app.vault.configDir || ".obsidian"}/cache/`) && !file.path.endsWith("/.authority.sqlite3") && file.path !== ".authority.sqlite3";
   }
+  isUploadCandidate(file) {
+    return this.included(file);
+  }
   async localHashes() {
+    var _a;
     const result = {};
-    for (const file of this.app.vault.getFiles().filter((f) => this.included(f))) result[file.path] = await this.hash(await this.app.vault.readBinary(file));
+    for (const file of this.app.vault.getFiles().filter((f) => this.included(f))) {
+      const stat = ((_a = this.app.vault.adapter) == null ? void 0 : _a.stat) ? await this.app.vault.adapter.stat(file.path) : void 0;
+      const cached = this.syncState.files[file.path];
+      if (!this.dirtyPaths.has(file.path) && (cached == null ? void 0 : cached.localHash) && stat && cached.localSize === stat.size && cached.localMtime === stat.mtime) result[file.path] = cached.localHash;
+      else result[file.path] = await this.hash(await this.app.vault.readBinary(file));
+      this.dirtyPaths.delete(file.path);
+    }
     return result;
   }
   async hash(data) {
@@ -1071,7 +1095,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     if (eligible()) await this.syncWithServer(true);
   }
   async syncWithServer(pullOnly = false) {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
     if (this.syncing || this.submitting || this.pairing) {
       new import_obsidian.Notice("Sync already in progress.");
       return;
@@ -1104,7 +1128,9 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
         blockedPaths.add(path);
         delete server[path];
       }
-      const decisions = planSync(this.syncState, local, server, {}, {}, blockedPaths);
+      const retryExcluded = new Set(this.excludedRetries);
+      this.excludedRetries.clear();
+      const decisions = planSync(this.syncState, local, server, {}, {}, blockedPaths, { allowLocalSubmissions: false, retryExcluded });
       const reviews = [];
       const failures = [];
       for (const decision of decisions) {
@@ -1114,13 +1140,23 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
             if (validateRelativePath(file.path) !== decision.path) throw new Error("Corrupted file transfer");
             const bytes = base64ToBytes(file.content_base64);
             if (await this.hash(bytes.buffer) !== decision.serverHash) throw new Error("Corrupted file transfer");
+            if (decision.reason === "server-authoritative-overwrite" && local[decision.path] !== null && local[decision.path] !== void 0) await this.cacheLocalBeforeOverwrite(decision.path, manifest.revision_id, decision.serverHash, local[decision.path]);
             const result = await this.writeFile(decision.path, bytes, "pull", (_b = local[decision.path]) != null ? _b : null);
             if (result.status === "conflict") reviews.push(`${decision.path}: ${(_c = result.reason) != null ? _c : "path collision; manual review required"}`);
-            else this.syncState.files[decision.path] = { baseHash: decision.serverHash };
+            else {
+              this.syncState.files[decision.path] = { baseHash: decision.serverHash, localHash: decision.serverHash };
+              local[decision.path] = decision.serverHash;
+              this.dirtyPaths.delete(decision.path);
+              delete this.syncState.excludedFiles[decision.path];
+            }
           } else if (decision.kind === "submit" && !pullOnly) {
             const pending = await this.pendingFor(decision.path, decision.operation, manifest.revision_id);
             if (pending) this.syncState.pendingSubmissions.push(pending);
-          } else if (decision.kind === "clean") this.syncState.files[decision.path] = { baseHash: decision.hash };
+          } else if (decision.kind === "excluded") {
+            this.syncState.excludedFiles[decision.path] = { serverHash: decision.serverHash, size: decision.size, reason: "file-too-large" };
+            reviews.push(`${decision.path}: ${decision.reason}`);
+          } else if (decision.kind === "review") reviews.push(`${decision.path}: ${decision.reason}`);
+          else if (decision.kind === "clean") this.syncState.files[decision.path] = { ...this.syncState.files[decision.path], baseHash: decision.hash, localHash: decision.hash };
           else if (decision.kind === "conflict") {
             reviews.push(`${decision.path}: ${(_d = decision.reason) != null ? _d : "manual review required"}`);
             await this.cacheConflict(transport, manifest.revision_id, decision);
@@ -1129,7 +1165,13 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
           const diagnostic = error == null ? void 0 : error.diagnostic;
           failures.push({ path: decision.path, message: safeError(error), status: (_e = diagnostic == null ? void 0 : diagnostic.status) != null ? _e : error == null ? void 0 : error.status, retryable: (_f = diagnostic == null ? void 0 : diagnostic.retryable) != null ? _f : false, diagnostic });
         }
-        await this.saveSync();
+      }
+      for (const file of this.app.vault.getFiles().filter((f) => this.included(f))) {
+        const stat = ((_g = this.app.vault.adapter) == null ? void 0 : _g.stat) ? await this.app.vault.adapter.stat(file.path) : void 0;
+        if (stat && this.syncState.files[file.path]) {
+          const knownHash = (_h = local[file.path]) != null ? _h : this.syncState.files[file.path].baseHash;
+          this.syncState.files[file.path] = { ...this.syncState.files[file.path], localHash: knownHash, localSize: stat.size, localMtime: stat.mtime };
+        }
       }
       this.localDirty = !isLocalClean(this.syncState, await this.localHashes());
       if (!failures.length) this.syncState.serverRevision = manifest.revision_id;
@@ -1140,7 +1182,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice(syncNotice(decisions, reviews, failures, manifest.files.length));
     } catch (error) {
       const diagnostic = error == null ? void 0 : error.diagnostic;
-      const pairingRequired = (diagnostic == null ? void 0 : diagnostic.reason) === "missing_credentials" || (diagnostic == null ? void 0 : diagnostic.reason) === "credentials_rejected" || this.pairingStatus.kind === "not-paired" && ((_g = this.errors.at(-1)) == null ? void 0 : _g.status) === 401;
+      const pairingRequired = (diagnostic == null ? void 0 : diagnostic.reason) === "missing_credentials" || (diagnostic == null ? void 0 : diagnostic.reason) === "credentials_rejected" || this.pairingStatus.kind === "not-paired" && ((_i = this.errors.at(-1)) == null ? void 0 : _i.status) === 401;
       const answered = this.requestsSent > requestsBefore;
       if (this.diagnosticSequence === diagnosticsBefore) {
         const recorded = diagnostic != null ? diagnostic : localFailure("sync", "local_operation_failed", answered).diagnostic;
@@ -1152,7 +1194,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       } catch (e) {
       }
       this.updateStatus(true);
-      const heading = pairingRequired ? "Pairing required. Open Settings \u2192 Server Authority Sync \u2192 Advanced settings \u2192 Device pairing \u2192 Test and pair." : (diagnostic == null ? void 0 : diagnostic.reason) === "persistence_failure" ? "Sync blocked: credentials could not be stored or verified." : `Sync failed: ${safeError(error)}.`;
+      const heading = pairingRequired ? "Pairing required. Open Settings \u2192 Server Authority Sync \u2192 Advanced settings \u2192 Device pairing \u2192 Test and pair." : (diagnostic == null ? void 0 : diagnostic.reason) === "persistence_failure" ? "Sync blocked: plugin state could not be stored or verified." : `Sync failed: ${safeError(error)}.`;
       new import_obsidian.Notice(`${heading} ${this.diagnosticSummary()} State was retained.`, 15e3);
     } finally {
       this.syncing = false;
@@ -1171,24 +1213,145 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     }
     return createPendingSubmission(baseRevisionId, [change]);
   }
-  async cacheConflict(transport, revision, decision) {
-    var _a;
-    if (this.syncState.conflicts.some((c) => c.path === decision.path && c.serverRevisionId === revision)) return;
-    let cachePath = "";
-    if (decision.serverHash) {
-      const file = await transport.readFile(decision.path);
-      const candidate = `${this.pluginRoot()}/conflicts/${encodeURIComponent(decision.path)}-${encodeURIComponent(revision)}.bin`;
+  async persistOverwriteBackup(record) {
+    var _a, _b;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await this.saveSync();
+      let data = null;
       try {
-        const bytes = base64ToBytes(file.content_base64);
-        if (file.path !== decision.path || await this.hash(bytes.buffer) !== decision.serverHash) throw new Error("Corrupted conflict transfer");
-        const result = await this.writeFile(candidate, bytes, "cache");
-        if (result.status !== "conflict") cachePath = candidate;
-      } catch (error) {
-        this.recordDiagnostic({ stage: "conflict-cache", code: "invalid_response", retryCount: 0, retryable: true });
+        data = await this.loadData();
+      } catch (e) {
       }
+      const saved = (_b = (_a = data == null ? void 0 : data.sync) == null ? void 0 : _a.overwriteBackups) == null ? void 0 : _b.find((item) => item.cachePath === record.cachePath);
+      if (saved && saved.path === record.path && saved.localHash === record.localHash && saved.serverHash === record.serverHash && saved.serverRevisionId === record.serverRevisionId && saved.cacheHash === record.cacheHash && saved.createdAt === record.createdAt) return;
     }
-    const record = { conflictId: crypto.randomUUID(), path: decision.path, paths: [decision.path], baseHash: decision.baseHash, localHash: decision.localHash, serverHash: decision.serverHash, serverRevisionId: revision, serverCachePath: cachePath, createdAt: (/* @__PURE__ */ new Date()).toISOString(), reason: (_a = decision.reason) != null ? _a : "same-path concurrent change", scope: "same-path" };
-    this.syncState.conflicts.push(record);
+    this.storageFailed = true;
+    this.pairingStatus = { kind: "save-failed" };
+    this.updateStatus();
+    const error = localFailure("storage", "persistence_failure");
+    this.recordDiagnostic(error.diagnostic);
+    throw error;
+  }
+  async cacheLocalBeforeOverwrite(path, revision, serverHash, expectedLocalHash) {
+    var _a;
+    const local = this.app.vault.getAbstractFileByPath(path);
+    if (!(local instanceof import_obsidian.TFile)) throw new Error("Local file disappeared before its overwrite backup");
+    const bytes = new Uint8Array(await this.app.vault.readBinary(local));
+    const localHash = await this.hash(bytes.buffer);
+    if (localHash !== expectedLocalHash) throw new Error("Local file changed before its overwrite backup");
+    const cachePath = `${this.pluginRoot()}/overwrites/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
+    const saved = await this.writeFile(cachePath, bytes, "cache");
+    if (saved.status === "conflict") throw new Error((_a = saved.reason) != null ? _a : "Overwrite backup could not be stored safely");
+    const cachedFile = this.app.vault.getAbstractFileByPath(cachePath);
+    if (!(cachedFile instanceof import_obsidian.TFile)) throw new Error("Overwrite backup is not readable");
+    const cachedBytes = new Uint8Array(await this.app.vault.readBinary(cachedFile));
+    const cacheHash = await this.hash(cachedBytes.buffer);
+    if (cacheHash !== localHash) throw new Error("Overwrite backup verification failed");
+    const record = { path, localHash, serverHash, serverRevisionId: revision, cachePath, cacheHash, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+    const existing = this.syncState.overwriteBackups.findIndex((item) => item.cachePath === cachePath);
+    if (existing >= 0) this.syncState.overwriteBackups[existing] = record;
+    else this.syncState.overwriteBackups.push(record);
+    await this.persistOverwriteBackup(record);
+  }
+  async openOverwriteBackup(record) {
+    try {
+      const cachedFile = this.app.vault.getAbstractFileByPath(record.cachePath);
+      if (!(cachedFile instanceof import_obsidian.TFile)) throw new Error("Preserved local copy is missing");
+      const bytes = new Uint8Array(await this.app.vault.readBinary(cachedFile));
+      const hash = await this.hash(bytes.buffer);
+      if (hash !== record.cacheHash || hash !== record.localHash) throw new Error("Preserved local copy verification failed");
+      await this.app.workspace.openLinkText(record.cachePath, "", false);
+    } catch (error) {
+      new import_obsidian.Notice(`${record.path}: preserved local copy could not be opened; ${safeError(error)}.`);
+    }
+  }
+  async verifyOverwriteBackup(record) {
+    try {
+      const cachedFile = this.app.vault.getAbstractFileByPath(record.cachePath);
+      if (!(cachedFile instanceof import_obsidian.TFile)) throw new Error("Preserved local copy is missing");
+      const bytes = new Uint8Array(await this.app.vault.readBinary(cachedFile));
+      const hash = await this.hash(bytes.buffer);
+      if (hash !== record.cacheHash || hash !== record.localHash) throw new Error("Preserved local copy verification failed");
+      new import_obsidian.Notice(`${record.path}: preserved local copy verified.`);
+    } catch (error) {
+      new import_obsidian.Notice(`${record.path}: preserved local copy verification failed; ${safeError(error)}.`);
+    }
+  }
+  /** Explicit user selection is the only path from a local edit to an upload submission. */
+  async selectLocalChanges(paths) {
+    const unique = [...new Set(paths.map((path) => validateRelativePath(path)))];
+    if (!this.syncState.serverRevision) throw new Error("Sync with server before selecting uploads so the current revision can be submitted safely.");
+    for (const path of unique) {
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof import_obsidian.TFile) || !this.included(file)) throw new Error(`${path}: local file is no longer available for upload`);
+      const pending = await this.pendingFor(path, "write", this.syncState.serverRevision);
+      if (pending) this.syncState.pendingSubmissions.push(pending);
+    }
+    await this.saveSync();
+    new import_obsidian.Notice(unique.length ? `Selected ${unique.length} local path(s) for upload. Submit pending changes to request server approval.` : "No local paths selected.");
+  }
+  async cacheConflict(transport, revision, decision) {
+    var _a, _b, _c, _d;
+    const existing = this.syncState.conflicts.find((c) => c.path === decision.path && c.serverRevisionId === revision);
+    if (existing == null ? void 0 : existing.serverCachePath) return;
+    let cachePath = "";
+    let cacheHash = null;
+    const candidate = `${this.pluginRoot()}/conflicts/${encodeURIComponent(decision.path)}-${encodeURIComponent(revision)}.bin`;
+    try {
+      let bytes;
+      if (decision.serverHash) {
+        const file = await transport.readFile(decision.path);
+        bytes = base64ToBytes(file.content_base64);
+        if (file.path !== decision.path || await this.hash(bytes.buffer) !== decision.serverHash) throw new Error("Corrupted conflict transfer");
+      } else {
+        const local = this.app.vault.getAbstractFileByPath(decision.path);
+        if (!(local instanceof import_obsidian.TFile)) throw new Error("local deletion review has no bytes to cache");
+        bytes = new Uint8Array(await this.app.vault.readBinary(local));
+        if (await this.hash(bytes.buffer) !== decision.localHash) throw new Error("Local deletion review changed before backup");
+      }
+      const result = await this.writeFile(candidate, bytes, "cache");
+      if (result.status !== "conflict") {
+        cachePath = candidate;
+        cacheHash = await this.hash(bytes.buffer);
+      }
+    } catch (error) {
+      this.recordDiagnostic({ stage: "conflict-cache", code: "invalid_response", retryCount: 0, retryable: true });
+    }
+    const record = { conflictId: (_a = existing == null ? void 0 : existing.conflictId) != null ? _a : crypto.randomUUID(), path: decision.path, paths: [decision.path], baseHash: decision.baseHash, localHash: decision.localHash, serverHash: decision.serverHash, serverRevisionId: revision, serverCachePath: cachePath || (existing == null ? void 0 : existing.serverCachePath) || "", cacheHash: (_b = cacheHash != null ? cacheHash : existing == null ? void 0 : existing.cacheHash) != null ? _b : null, createdAt: (_c = existing == null ? void 0 : existing.createdAt) != null ? _c : (/* @__PURE__ */ new Date()).toISOString(), reason: (_d = decision.reason) != null ? _d : "same-path concurrent change", scope: "same-path", resolution: existing == null ? void 0 : existing.resolution };
+    if (existing) Object.assign(existing, record);
+    else this.syncState.conflicts.push(record);
+  }
+  async deleteServerDeletion(conflictId) {
+    const record = this.syncState.conflicts.find((item) => item.conflictId === conflictId);
+    if (!record || record.resolution || record.serverHash !== null || record.reason !== "server-deletion-retained-locally" || !record.serverCachePath || !record.localHash) {
+      new import_obsidian.Notice("Local deletion is not available: a verified recovery cache is required.");
+      return;
+    }
+    try {
+      const cached = new Uint8Array(await this.app.vault.readBinary({ path: record.serverCachePath }));
+      const cachedHash = await this.hash(cached.buffer);
+      if (cachedHash !== record.localHash || record.cacheHash && cachedHash !== record.cacheHash) throw new Error("Recovery cache verification failed");
+      const local = this.app.vault.getAbstractFileByPath(record.path);
+      if (!(local instanceof import_obsidian.TFile)) throw new Error("Local file is already absent");
+      const current = new Uint8Array(await this.app.vault.readBinary(local));
+      if (await this.hash(current.buffer) !== record.localHash) throw new Error("Local file changed; deletion cancelled");
+      await this.app.vault.delete(local);
+      delete this.syncState.files[record.path];
+      record.resolution = "deleted";
+      await this.saveSync();
+      new import_obsidian.Notice(`${record.path}: local copy deleted; recovery cache retained.`);
+    } catch (error) {
+      new import_obsidian.Notice(`${record.path}: deletion cancelled; ${safeError(error)}.`);
+    }
+  }
+  async retryExcludedFile(path) {
+    path = validateRelativePath(path);
+    if (!this.syncState.excludedFiles[path]) {
+      new import_obsidian.Notice(`${path}: no excluded large-file record is available.`);
+      return;
+    }
+    this.excludedRetries.add(path);
+    await this.syncWithServer();
   }
   async submitPendingChanges() {
     var _a;
@@ -1243,11 +1406,14 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     }
   }
   async openConflicts() {
-    if (!this.syncState.conflicts.length) {
-      new import_obsidian.Notice("No conflicts.");
+    if (!this.syncState.conflicts.length && !this.syncState.overwriteBackups.length) {
+      new import_obsidian.Notice("No conflicts or preserved local copies.");
       return;
     }
     new ConflictModal(this.app, this).open();
+  }
+  openLocalUploadPicker() {
+    new LocalUploadPickerModal(this.app, this).open();
   }
   async openPendingSubmissions() {
     if (!pendingDisplayRows(this.syncState.pendingSubmissions).length) {
@@ -1258,6 +1424,12 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   }
   syncStateForUi() {
     return this.syncState.conflicts;
+  }
+  overwriteBackupsForUi() {
+    return this.syncState.overwriteBackups;
+  }
+  syncStateForUiExcluded() {
+    return this.syncState.excludedFiles;
   }
   pendingForUi() {
     return this.syncState.pendingSubmissions;
@@ -1430,6 +1602,16 @@ var AuthoritySettingTab = class extends import_obsidian.PluginSettingTab {
     };
     common.addButton((b) => b.setButtonText("Open conflicts").onClick(() => void this.plugin.openConflicts()));
     common.addButton((b) => b.setButtonText("Pending submissions").onClick(() => void this.plugin.openPendingSubmissions()));
+    common.addButton((b) => b.setButtonText("Select local uploads").onClick(() => void this.plugin.openLocalUploadPicker()));
+    for (const path of Object.keys(this.plugin.syncStateForUiExcluded())) common.addButton((b) => b.setButtonText(`Retry excluded ${path}`).onClick(async () => {
+      b.setDisabled(true);
+      try {
+        await this.plugin.retryExcludedFile(path);
+        this.display();
+      } finally {
+        b.setDisabled(false);
+      }
+    }));
     applyActionRowLayout(common.controlEl);
     const advanced = containerEl.createEl("details", { cls: "server-authority-advanced-settings" });
     advanced.createEl("summary", { text: "Advanced settings (server, pairing, automation, AI)" });
@@ -1477,7 +1659,7 @@ var AuthoritySettingTab = class extends import_obsidian.PluginSettingTab {
         await saved(() => this.plugin.saveSettings());
       }
     }));
-    new import_obsidian.Setting(advancedEl).setName("Sync policy").addDropdown((d) => d.addOption("manual", "Manual").addOption("pull-when-clean", "Pull when clean").setValue(this.plugin.settings.syncPolicy).onChange(async (value) => {
+    new import_obsidian.Setting(advancedEl).setName("Sync policy").setDesc("Server downloads are authoritative by default. Obsidian APIs cannot enforce OS-level read-only or immutable locking.").addDropdown((d) => d.addOption("server-authoritative", "Server authoritative (read-only by policy)").addOption("manual", "Manual").addOption("pull-when-clean", "Pull when clean").setValue(this.plugin.settings.syncPolicy).onChange(async (value) => {
       this.plugin.settings.syncPolicy = value;
       await saved(() => this.plugin.saveSettings());
     }));
@@ -1511,14 +1693,28 @@ var ConflictModal = class extends import_obsidian.Modal {
   }
   render() {
     var _a, _b;
-    this.titleEl.setText("Conflicts");
+    this.titleEl.setText("Sync reviews and preserved copies");
     this.contentEl.empty();
+    const backups = this.plugin.overwriteBackupsForUi();
+    if (backups.length) {
+      this.contentEl.createEl("h2", { text: "Preserved local copies" });
+      this.contentEl.createEl("p", { text: "These local files were verified and preserved before server-authoritative updates." });
+      for (const backup of backups) {
+        const section = this.contentEl.createDiv({ cls: "server-authority-overwrite-backup" });
+        section.createEl("h3", { text: backup.path });
+        section.createEl("p", { text: `Preserved hash: ${backup.localHash}
+Server hash: ${backup.serverHash}
+Server revision: ${backup.serverRevisionId}` });
+        const actions = new import_obsidian.Setting(section).addButton((button) => button.setButtonText("Open preserved local copy").onClick(() => void this.plugin.openOverwriteBackup(backup))).addButton((button) => button.setButtonText("Verify preserved local copy").onClick(() => void this.plugin.verifyOverwriteBackup(backup)));
+        applyActionRowLayout(actions.controlEl);
+      }
+    }
     const rows = conflictDisplayRows(this.plugin.syncStateForUi());
     if (!rows.length) {
-      this.contentEl.createEl("p", { text: "No conflicts." });
+      if (!backups.length) this.contentEl.createEl("p", { text: "No conflicts or preserved local copies." });
       return;
     }
-    this.contentEl.createEl("p", { text: "Only the same file changed on both sides is a conflict; changes to other files do not conflict." });
+    this.contentEl.createEl("p", { text: "Server deletion reviews retain local bytes. Delete a local copy only after the recovery cache is verified." });
     for (const row of rows) {
       const section = this.contentEl.createDiv({ cls: "server-authority-conflict" });
       section.createEl("h3", { text: row.path });
@@ -1527,13 +1723,57 @@ Scope: ${(_b = row.scope) != null ? _b : "same-path"}
 Base: ${row.baseLabel}
 Local: ${row.localLabel}
 Server: ${row.serverLabel}
-Server revision: ${row.serverRevisionId}` });
-      const actions = new import_obsidian.Setting(section).addButton((button) => button.setButtonText("Open server cache").setDisabled(!row.serverCachePath).onClick(() => void this.plugin.openConflictCache(row))).addButton((button) => button.setButtonText("Mark handled").onClick(async () => {
+Server revision: ${row.serverRevisionId}${row.resolution ? `
+Resolution: ${row.resolution}; recovery cache retained` : ""}` });
+      const actions = new import_obsidian.Setting(section).addButton((button) => button.setButtonText("Open server cache").setDisabled(!row.serverCachePath).onClick(() => void this.plugin.openConflictCache(row)));
+      if (row.reason === "server-deletion-retained-locally" && row.serverCachePath && !row.resolution) actions.addButton((button) => button.setButtonText("Verify backup and delete local copy").onClick(async () => {
+        button.setDisabled(true);
+        await this.plugin.deleteServerDeletion(row.conflictId);
+        this.render();
+      }));
+      if (!row.resolution && row.reason !== "server-deletion-retained-locally") actions.addButton((button) => button.setButtonText("Mark handled").onClick(async () => {
         await this.plugin.resolveConflict(row.conflictId);
         this.render();
       }));
       applyActionRowLayout(actions.controlEl);
     }
+  }
+};
+var LocalUploadPickerModal = class extends import_obsidian.Modal {
+  constructor(app, plugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+  onOpen() {
+    this.titleEl.setText("Select local uploads");
+    this.contentEl.empty();
+    const selected = /* @__PURE__ */ new Set();
+    const files = this.plugin.app.vault.getFiles().filter((file) => this.plugin.isUploadCandidate(file));
+    if (!files.length) {
+      this.contentEl.createEl("p", { text: "No local files are available for explicit upload selection." });
+      return;
+    }
+    this.contentEl.createEl("p", { text: "Select exact paths to create pending uploads. Nothing is submitted until you use Submit pending changes." });
+    for (const file of files) new import_obsidian.Setting(this.contentEl).setName(file.path).addButton((button) => button.setButtonText(`Select ${file.path}`).onClick(() => {
+      if (selected.has(file.path)) {
+        selected.delete(file.path);
+        button.setButtonText(`Select ${file.path}`);
+      } else {
+        selected.add(file.path);
+        button.setButtonText(`Selected ${file.path}`);
+      }
+    }));
+    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("Queue selected uploads").onClick(async () => {
+      button.setDisabled(true);
+      try {
+        await this.plugin.selectLocalChanges([...selected]);
+        this.close();
+      } catch (error) {
+        new import_obsidian.Notice(safeError(error));
+      } finally {
+        button.setDisabled(false);
+      }
+    }));
   }
 };
 var PendingSubmissionsModal = class extends import_obsidian.Modal {
