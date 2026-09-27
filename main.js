@@ -80,7 +80,7 @@ function createPendingSubmission(baseRevisionId, changes) {
   return { submissionId: crypto.randomUUID(), baseRevisionId, changes, createdAt: (/* @__PURE__ */ new Date()).toISOString(), retryCount: 0 };
 }
 function emptySyncState() {
-  return { version: SYNC_STATE_VERSION, serverRevision: null, files: {}, excludedFiles: {}, pendingSubmissions: [], conflicts: [], overwriteBackups: [] };
+  return { version: SYNC_STATE_VERSION, serverRevision: null, files: {}, excludedFiles: {}, pendingSubmissions: [], conflicts: [], overwriteBackups: [], deletionBackups: [] };
 }
 function normalizeSyncState(value) {
   var _a, _b;
@@ -93,7 +93,9 @@ function normalizeSyncState(value) {
   const excludedFiles = {};
   for (const [path, entry] of Object.entries((_b = input.excludedFiles) != null ? _b : {})) if (entry && typeof entry.serverHash === "string" && typeof entry.size === "number" && entry.reason === "file-too-large") excludedFiles[path] = entry;
   const overwriteBackups = Array.isArray(input.overwriteBackups) ? input.overwriteBackups.filter((item) => item && typeof item.path === "string" && typeof item.localHash === "string" && typeof item.serverHash === "string" && typeof item.serverRevisionId === "string" && typeof item.cachePath === "string" && typeof item.cacheHash === "string" && typeof item.createdAt === "string") : [];
-  return { version: SYNC_STATE_VERSION, serverRevision: typeof input.serverRevision === "string" ? input.serverRevision : null, files, excludedFiles, pendingSubmissions: Array.isArray(input.pendingSubmissions) ? input.pendingSubmissions : [], conflicts: Array.isArray(input.conflicts) ? input.conflicts : [], overwriteBackups };
+  const rawDeletionBackups = input.deletionBackups;
+  const deletionBackups = Array.isArray(rawDeletionBackups) ? rawDeletionBackups.filter((item) => item && typeof item.path === "string" && typeof item.localHash === "string" && typeof item.serverRevisionId === "string" && typeof item.cachePath === "string" && typeof item.cacheHash === "string" && typeof item.createdAt === "string") : void 0;
+  return { version: SYNC_STATE_VERSION, serverRevision: typeof input.serverRevision === "string" ? input.serverRevision : null, files, excludedFiles, pendingSubmissions: Array.isArray(input.pendingSubmissions) ? input.pendingSubmissions : [], conflicts: Array.isArray(input.conflicts) ? input.conflicts : [], overwriteBackups, ...deletionBackups ? { deletionBackups } : {} };
 }
 function isLocalClean(state, local) {
   return [.../* @__PURE__ */ new Set([...Object.keys(local), ...Object.keys(state.files)])].every((path) => {
@@ -102,6 +104,43 @@ function isLocalClean(state, local) {
   });
 }
 var MAX_SYNC_FILE_BYTES = 16 * 1024 * 1024;
+function safeManifestPath(path) {
+  return typeof path === "string" && !!path && !path.startsWith("/") && !path.includes("\\") && path.split("/").every((part) => !!part && part !== "." && part !== "..");
+}
+function validateSyncManifest(input) {
+  if (!input || typeof input !== "object") return { complete: false, files: [], blocked: [], reason: "manifest-not-an-object" };
+  const value = input;
+  if (value.protocol_version !== "1" || typeof value.revision_id !== "string" || !value.revision_id || !Array.isArray(value.files)) return { complete: false, files: [], blocked: [], reason: "manifest-header-invalid" };
+  const files = [];
+  const paths = /* @__PURE__ */ new Set();
+  let reason;
+  for (const item of value.files) {
+    const file = item;
+    if (!safeManifestPath(file.path) || typeof file.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(file.sha256) || !Number.isInteger(file.size) || file.size < 0 || paths.has(file.path)) {
+      reason != null ? reason : reason = "manifest-file-invalid";
+      continue;
+    }
+    paths.add(file.path);
+    files.push({ path: file.path, sha256: file.sha256, size: file.size });
+  }
+  const blocked = [];
+  if (value.blocked !== void 0 && !Array.isArray(value.blocked)) reason != null ? reason : reason = "manifest-blocked-invalid";
+  for (const item of Array.isArray(value.blocked) ? value.blocked : []) {
+    const entry = item;
+    if (!safeManifestPath(entry.path) || entry.reason !== void 0 && typeof entry.reason !== "string") {
+      reason != null ? reason : reason = "manifest-blocked-invalid";
+      continue;
+    }
+    blocked.push({ path: entry.path, ...entry.reason === void 0 ? {} : { reason: entry.reason } });
+  }
+  const allPaths = [...paths];
+  if (allPaths.some((path) => allPaths.some((other) => path !== other && other.startsWith(path + "/")))) reason != null ? reason : reason = "manifest-file-directory-collision";
+  return { complete: !reason && blocked.length === 0, files, blocked, ...reason ? { reason } : {} };
+}
+function uploadConfirmation(paths, server) {
+  const exact = [...new Set(paths)].sort();
+  return { paths: exact, additions: exact.filter((path) => !server[path]).length, overwrites: exact.filter((path) => !!server[path]).length };
+}
 function planSync(state, local, server, localKinds = {}, serverKinds = {}, blocked = /* @__PURE__ */ new Set(), options = { allowLocalSubmissions: false }) {
   const paths = /* @__PURE__ */ new Set([...Object.keys(state.files), ...Object.keys(local), ...Object.keys(server), ...Object.keys(localKinds), ...Object.keys(serverKinds)]);
   const localAdded = Object.keys(local).filter((path) => !state.files[path]);
@@ -124,24 +163,15 @@ function planSync(state, local, server, localKinds = {}, serverKinds = {}, block
       return path.startsWith(parent + "/") && ((_a2 = localKinds[parent]) != null ? _a2 : serverKinds[parent]) === "file";
     });
     if (collision || ancestorCollision) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "file-directory-collision" };
-    if (serverHash === null && localHash !== null && base === localHash && state.files[path]) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: renameLike ? "rename-like-delete-review" : "server-deletion-retained-locally" };
-    if (serverHash === null && localHash === null && state.files[path] && renameLike) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "rename-like-delete-review" };
-    if (state.files[path] && localHash === null && serverHash !== null) return { kind: "pull", path, serverHash };
-    if (!state.files[path] && serverHash !== null && localHash === null) return { kind: "pull", path, serverHash };
-    if (localHash === null && serverHash === null) return { kind: "clean", path, hash: null };
+    if (serverHash === null && localHash !== null && options.allowLocalDeletes && options.manifestComplete !== false) return { kind: "delete-local", path, localHash, reason: "not-present-on-server" };
+    if (serverHash === null && localHash !== null && base === localHash && state.files[path]) {
+      return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: renameLike ? "rename-like-delete-review" : "server-deletion-retained-locally" };
+    }
+    if (serverHash === null && localHash === null) return { kind: "clean", path, hash: null };
     if (localHash === serverHash) return { kind: "clean", path, hash: localHash };
-    if (!state.files[path] && serverHash === null && localHash !== null) {
-      if (renameLike) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "rename-like-add-review" };
-      return options.allowLocalSubmissions ? { kind: "submit", path, localHash, operation: "write", reason: "local-addition-pending" } : { kind: "review", path, localHash, reason: "local-addition-explicit-selection-required" };
-    }
-    if (localHash === base) return { kind: "pull", path, serverHash };
-    if (options.allowLocalSubmissions === false && serverHash !== null && serverHash !== base) return { kind: "pull", path, serverHash, reason: "server-authoritative-overwrite" };
-    if (serverHash === base) {
-      if (localHash === null) return { kind: "pull", path, serverHash };
-      return options.allowLocalSubmissions ? { kind: "submit", path, localHash, operation: "write" } : { kind: "review", path, localHash, reason: "local-change-explicit-selection-required" };
-    }
-    if (!state.files[path] && serverHash !== null && localHash !== null) return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "simultaneous-add-review" };
-    return { kind: "conflict", path, baseHash: base, localHash, serverHash, reason: "simultaneous-edit-review" };
+    if (serverHash !== null) return { kind: "pull", path, serverHash, ...localHash === null ? {} : { reason: "server-authoritative-overwrite" } };
+    if (localHash === null) return { kind: "clean", path, hash: null };
+    return { kind: "review", path, localHash, reason: "incomplete-server-manifest" };
   });
 }
 function classifySubmitResult(result) {
@@ -234,11 +264,12 @@ function reconcileCreateRace(input) {
   return { action: "conflict", reason: input.existing === "folder" ? "path is a folder" : "local file appeared during pull" };
 }
 function classifySyncOutcome(input) {
-  var _a, _b, _c, _d;
+  var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
   const decisions = (_a = input.decisions) != null ? _a : [];
   const reviewTexts = (_b = input.reviews) != null ? _b : [];
   const errors = (_c = input.errors) != null ? _c : [];
   const pulls = decisions.filter((d) => d.kind === "pull");
+  const deletes = decisions.filter((d) => d.kind === "delete-local");
   const clean = decisions.filter((d) => d.kind === "clean");
   const pending = decisions.filter((d) => d.kind === "submit");
   const conflicts = decisions.filter((d) => d.kind === "conflict");
@@ -251,27 +282,31 @@ function classifySyncOutcome(input) {
   }).length;
   const nonRetryableFailures = errors.length - retryableFailures;
   const pendingAdditions = pending.filter((d) => d.reason === "local-addition-pending" || d.reason === "local-addition-review").length;
-  const kind = errors.length && !pulls.length && !pending.length && !reviewPaths.length ? "failed" : reviewPaths.length || errors.length ? "review" : pulls.length || pending.length || blocked.length ? "complete" : "no-op";
+  const pulled = (_e = (_d = input.actual) == null ? void 0 : _d.pulled) != null ? _e : pulls.length;
+  const deleted = (_g = (_f = input.actual) == null ? void 0 : _f.deleted) != null ? _g : deletes.length;
+  const alreadyCurrent = (_i = (_h = input.actual) == null ? void 0 : _h.alreadyCurrent) != null ? _i : clean.length;
+  const kind = errors.length && !pulled && !deleted && !pending.length && !reviewPaths.length ? "failed" : reviewPaths.length || errors.length ? "review" : pulled || deleted || pending.length || blocked.length ? "complete" : "no-op";
   const failurePaths = errors.map((error) => error == null ? void 0 : error.path).filter((path) => typeof path === "string");
-  return { kind, manifestFiles: (_d = input.manifestFiles) != null ? _d : decisions.length, pulled: pulls.length, skipped: clean.length, pendingAdditions, reviews: reviewPaths.length, retryableFailures, nonRetryableFailures, paths: pulls.map((d) => d.path), reviewPaths, errors, blocked: blocked.length, blockedPaths: blocked.map((d) => d.path), pendingChanges: pending.length, failurePaths };
+  return { kind, manifestFiles: (_j = input.manifestFiles) != null ? _j : decisions.length, pulled, deleted, skipped: alreadyCurrent, alreadyCurrent, pendingAdditions, reviews: reviewPaths.length, retryableFailures, nonRetryableFailures, paths: pulls.map((d) => d.path), reviewPaths, errors, blocked: blocked.length, blockedPaths: blocked.map((d) => d.path), pendingChanges: pending.length, failurePaths };
 }
 function listPaths(paths, limit = 3) {
   const unique = [...new Set(paths)];
   if (unique.length <= limit) return unique.join(", ");
   return `${unique.slice(0, limit).join(", ")} and ${unique.length - limit} more`;
 }
-function syncNotice(decisions, reviews = [], errors = [], manifestFiles = decisions.length) {
-  const outcome = classifySyncOutcome({ decisions, reviews, errors, manifestFiles });
+function syncNotice(decisions, reviews = [], errors = [], manifestFiles = decisions.length, actual) {
+  const outcome = classifySyncOutcome({ decisions, reviews, errors, manifestFiles, actual });
   if (outcome.kind === "no-op") return "All files are up to date. No synchronization needed.";
-  const summary = `Sync complete: ${outcome.manifestFiles} manifest file(s); ${outcome.pulled} pulled/updated, ${outcome.skipped} already up to date, ${outcome.pendingChanges} pending local change(s) (${outcome.pendingAdditions} addition(s)), ${outcome.reviews} needs review.${outcome.paths.length ? ` Pulled paths: ${listPaths(outcome.paths)}.` : ""}`;
+  const summary = `Sync complete: ${outcome.manifestFiles} manifest file(s); Pulled/updated: ${outcome.pulled}, Local deletions: ${outcome.deleted}, Already current: ${outcome.alreadyCurrent}, ${outcome.pendingChanges} pending local change(s) (${outcome.pendingAdditions} addition(s)), ${outcome.reviews} needs review.${outcome.paths.length ? ` Pulled paths: ${listPaths(outcome.paths)}.` : ""}`;
   const blocked = outcome.blocked ? ` ${outcome.blocked} file(s) the server cannot read, so they were not pulled: ${listPaths(outcome.blockedPaths)}. Nothing was deleted locally; ask the administrator to fix vault ownership/permissions.` : "";
   const reasons = errors.map((error) => error == null ? void 0 : error.message).filter((message) => !!message).slice(0, 2);
   const failures = errors.length ? ` Retryable failures: ${outcome.retryableFailures}; non-retryable failures: ${outcome.nonRetryableFailures}${outcome.failurePaths.length ? ` (${listPaths(outcome.failurePaths)})` : ""}.${reasons.length ? ` ${reasons.join(" ")}` : ""}` : "";
-  const detail = outcome.reviewPaths.length ? ` Review paths: ${outcome.reviewPaths.slice(0, 3).map((path) => {
+  const detailPaths = outcome.reviewPaths.length ? outcome.reviewPaths.slice(0, 3).map((path) => {
     var _a;
     return (_a = reviews.find((text) => text.startsWith(`${path}:`))) != null ? _a : path;
-  }).join("; ")}.` : "";
-  if (outcome.kind === "failed") return `Sync failed: ${outcome.nonRetryableFailures + outcome.retryableFailures} transport or file error(s). State was retained.`;
+  }) : outcome.failurePaths.slice(0, 3);
+  const detail = detailPaths.length ? ` Review paths: ${detailPaths.join("; ")}.` : "";
+  if (outcome.kind === "failed") return `Sync failed: ${outcome.nonRetryableFailures + outcome.retryableFailures} transport or file error(s)${outcome.failurePaths.length ? ` (${listPaths(outcome.failurePaths)}). Review paths: ${listPaths(outcome.failurePaths)}` : ""}. State was retained.`;
   return summary + blocked + failures + detail;
 }
 
@@ -395,11 +430,13 @@ function userFacingServerError(status, payload) {
       return "\u8BF7\u6C42\u8FC7\u4E8E\u9891\u7E41\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002";
     case "vault_unreadable":
       return "\u670D\u52A1\u5668\u65E0\u6CD5\u8BFB\u53D6\u5176 Vault \u4E2D\u7684\u6587\u4EF6\uFF08\u670D\u52A1\u5668\u7AEF\u6743\u9650\u95EE\u9898\uFF09\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u4FEE\u590D\uFF1B\u4F60\u7684\u914D\u5BF9\u4E0E\u51ED\u636E\u4E0D\u53D7\u5F71\u54CD\u3002";
+    case "upload_rollback_failed":
+      return "\u4E0A\u4F20\u5931\u8D25\u4E14\u670D\u52A1\u5668\u6587\u4EF6\u672A\u80FD\u5B8C\u6574\u6062\u590D\uFF0C\u5DF2\u505C\u6B62\u7EE7\u7EED\uFF1B\u8BF7\u7BA1\u7406\u5458\u6838\u67E5\u670D\u52A1\u5668\u6570\u636E\u3002";
     case "identity_mismatch":
       return "\u670D\u52A1\u5668\u8EAB\u4EFD\u4E0E\u8BBE\u7F6E\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u68C0\u67E5 Vault ID \u4E0E\u6307\u7EB9\u3002";
     case "request_too_large":
     case "file_too_large":
-      return "\u8BE5\u6587\u4EF6\u6216\u8BF7\u6C42\u8D85\u8FC7\u670D\u52A1\u5668\u5355\u6B21\u4E0A\u9650\uFF08\u9ED8\u8BA4\u8BF7\u6C42\u4F53\u7EA6 8 MB\u3001\u5355\u6587\u4EF6\u7EA6 16 MB\uFF09\uFF1A\u8BF7\u62C6\u5206\u6587\u4EF6\uFF0C\u6216\u628A\u5927\u9644\u4EF6\u653E\u5728\u540C\u6B65\u76EE\u5F55\u4E4B\u5916\u3002\u51ED\u636E\u4E0E\u672C\u5730\u6587\u4EF6\u672A\u53D7\u5F71\u54CD\u3002";
+      return "\u8BE5\u6587\u4EF6\u6216\u8BF7\u6C42\u8D85\u8FC7\u670D\u52A1\u5668\u5355\u6B21\u4E0A\u9650\uFF08\u9ED8\u8BA4\u8BF7\u6C42\u4F53 32 MiB\u3001\u5355\u6587\u4EF6 16 MiB\uFF09\uFF1A\u8BF7\u62C6\u5206\u6587\u4EF6\uFF0C\u6216\u628A\u5927\u9644\u4EF6\u653E\u5728\u540C\u6B65\u76EE\u5F55\u4E4B\u5916\u3002\u51ED\u636E\u4E0E\u672C\u5730\u6587\u4EF6\u672A\u53D7\u5F71\u54CD\u3002";
     case "internal_error":
       return "\u670D\u52A1\u5668\u5185\u90E8\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF1B\u8FD9\u4E0D\u4F1A\u4F7F\u914D\u5BF9\u5931\u6548\u3002";
   }
@@ -432,7 +469,7 @@ var LOCAL_REASONS = {
 function localFailure(stage, reason, requestSent = false) {
   return Object.assign(new Error(LOCAL_REASONS[reason]), { diagnostic: { stage, reason, retryCount: 0, retryable: false, requestSent } });
 }
-var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted", "invalid_response", "vault_unreadable", "internal_error", "request_too_large", "file_too_large", "identity_mismatch", "request_timeout", "server_busy"]);
+var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted", "invalid_response", "vault_unreadable", "internal_error", "request_too_large", "file_too_large", "upload_rollback_failed", "identity_mismatch", "request_timeout", "server_busy"]);
 function normalizeDiagnostics(value) {
   if (!Array.isArray(value)) return [];
   return value.filter((item) => {
@@ -448,6 +485,7 @@ function requestStage(path) {
   if (path.endsWith("/poll")) return "poll";
   if (path.endsWith("/manifest")) return "manifest";
   if (path.includes("/files/") || path.endsWith("/read")) return "file";
+  if (path.endsWith("/upload")) return "upload";
   if (path === "/submissions") return "submit";
   return path === "/enrollments/session" ? "session" : path === "/submissions/list" ? "submissions" : "setup";
 }
@@ -555,7 +593,7 @@ var RequestUrlTransport = class {
       if (this.enrollment) {
         const vault = `/vaults/${encodeURIComponent(this.settings.vaultId)}`;
         const readPath = body == null ? void 0 : body.path;
-        const operation = path === `${vault}/manifest` ? { type: "manifest" } : path.startsWith(`${vault}/files/`) ? { type: "read-file", path: decodeURIComponent(path.slice(`${vault}/files/`.length)) } : path === `${vault}/read` && typeof readPath === "string" ? { type: "read-file", path: readPath } : path === "/submissions/list" ? { type: "list-submissions" } : { type: "submit", submission: body };
+        const operation = path === `${vault}/manifest` ? { type: "manifest" } : path.startsWith(`${vault}/files/`) ? { type: "read-file", path: decodeURIComponent(path.slice(`${vault}/files/`.length)) } : path === `${vault}/read` && typeof readPath === "string" ? { type: "read-file", path: readPath } : path === `${vault}/upload` ? { type: "upload", files: body == null ? void 0 : body.files } : path === "/submissions/list" ? { type: "list-submissions" } : { type: "submit", submission: body };
         path = `/enrollments/${encodeURIComponent(this.enrollment.request_id)}/poll`;
         body = { protocol_version: PROTOCOL_VERSION, vault_id: this.settings.vaultId, server_fingerprint: this.settings.serverFingerprint, poll_secret: this.enrollment.poll_secret, operation };
       } else {
@@ -634,6 +672,10 @@ var RequestUrlTransport = class {
   readFile(path) {
     return this.request("POST", `/vaults/${encodeURIComponent(this.settings.vaultId)}/read`, { path: validateRelativePath(path) }, true);
   }
+  upload(files) {
+    const encoded = files.map((file) => ({ path: validateRelativePath(file.path), content_base64: file.contentBase64, sha256: file.sha256, expected_server_sha256: file.expectedServerSha256 }));
+    return this.request("POST", `/vaults/${encodeURIComponent(this.settings.vaultId)}/upload`, { files: encoded }, true);
+  }
   submit(value) {
     return this.request("POST", "/submissions", { protocol_version: PROTOCOL_VERSION, submission_id: value.submissionId, base_revision_id: value.baseRevisionId, changes: value.changes, created_at: value.createdAt }, true);
   }
@@ -660,6 +702,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "syncing", false);
     __publicField(this, "unloaded", false);
     __publicField(this, "submitting", false);
+    __publicField(this, "uploading", false);
     __publicField(this, "pairingStatus", { kind: "not-paired" });
     __publicField(this, "settings", mergeSettings());
     __publicField(this, "deviceToken", "");
@@ -755,11 +798,9 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.updateStatus();
     this.addSettingTab(new AuthoritySettingTab(this.app, this));
     this.addRibbonIcon("refresh-cw", "Sync with server", () => void this.syncWithServer()).setAttr("aria-label", "Sync with server");
-    this.addRibbonIcon("upload", "Submit pending changes", () => void this.submitPendingChanges()).setAttr("aria-label", "Submit pending changes");
+    this.addRibbonIcon("upload", "Upload selected local files", () => this.openLocalUploadPicker()).setAttr("aria-label", "Upload selected local files");
     this.addCommand({ id: "sync-with-server", name: "Sync with server", callback: () => void this.syncWithServer() });
-    this.addCommand({ id: "submit-pending-changes", name: "Submit pending changes", callback: () => void this.submitPendingChanges() });
     this.addCommand({ id: "open-conflicts", name: "Open conflicts", callback: () => void this.openConflicts() });
-    this.addCommand({ id: "open-pending-submissions", name: "Open pending submissions", callback: () => void this.openPendingSubmissions() });
     this.addCommand({ id: "test-server-connection", name: "Test server connection", callback: () => void this.testConnection() });
     this.addCommand({ id: "check-server-version", name: "Check server version", callback: () => void this.checkServerVersion() });
     this.addCommand({ id: "export-non-sensitive-configuration", name: "Export non-sensitive configuration", callback: () => void this.exportConfiguration() });
@@ -847,11 +888,11 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     }
   }
   statusText() {
-    return `${pairingStatusLabel(this.pairingStatus)} \xB7 ${this.syncing ? "Syncing" : this.submitting ? "Submitting" : this.localDirty ? "Local changes; sync to review" : "Idle"} \xB7 ${this.syncState.conflicts.length} conflicts \xB7 ${this.syncState.pendingSubmissions.length} pending`;
+    return `${pairingStatusLabel(this.pairingStatus)} \xB7 ${this.syncing ? "Syncing" : this.uploading ? "Uploading" : this.submitting ? "Processing" : this.localDirty ? "Local changes; upload selected paths" : "Idle"} \xB7 ${this.syncState.conflicts.length} blocked paths`;
   }
   updateStatus(offline = false) {
     var _a;
-    const suffix = offline ? "offline" : this.localDirty ? "local changes; sync to review" : this.syncState.conflicts.length ? "conflicts" : this.syncState.pendingSubmissions.length ? "pending" : "clean";
+    const suffix = offline ? "offline" : this.localDirty ? "local changes; upload selected paths" : this.syncState.conflicts.length ? "blocked paths" : "clean";
     if (this.statusBar) this.statusBar.setText(`Authority: ${suffix} \xB7 ${pairingStatusLabel(this.pairingStatus)}`);
     (_a = this.statusListener) == null ? void 0 : _a.call(this);
   }
@@ -990,9 +1031,14 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     var _a;
     const result = {};
     for (const file of this.app.vault.getFiles().filter((f) => this.included(f))) {
-      const stat = ((_a = this.app.vault.adapter) == null ? void 0 : _a.stat) ? await this.app.vault.adapter.stat(file.path) : void 0;
+      let stat;
+      try {
+        stat = ((_a = this.app.vault.adapter) == null ? void 0 : _a.stat) ? await this.app.vault.adapter.stat(file.path) : void 0;
+      } catch (e) {
+        stat = void 0;
+      }
       const cached = this.syncState.files[file.path];
-      if (!this.dirtyPaths.has(file.path) && (cached == null ? void 0 : cached.localHash) && stat && cached.localSize === stat.size && cached.localMtime === stat.mtime) result[file.path] = cached.localHash;
+      if (!this.dirtyPaths.has(file.path) && (cached == null ? void 0 : cached.localHash) && stat && stat.type !== "folder" && cached.localSize === stat.size && cached.localMtime === stat.mtime) result[file.path] = cached.localHash;
       else result[file.path] = await this.hash(await this.app.vault.readBinary(file));
       this.dirtyPaths.delete(file.path);
     }
@@ -1088,7 +1134,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     }
   }
   async autoPull() {
-    const eligible = () => this.settings.syncPolicy === "pull-when-clean" && this.pairingStatus.kind === "ready" && !this.pairing && !this.syncing && !this.submitting && !this.unloaded && !this.syncState.pendingSubmissions.length && !this.syncState.conflicts.length;
+    const eligible = () => this.settings.syncPolicy === "pull-when-clean" && this.pairingStatus.kind === "ready" && !this.pairing && !this.syncing && !this.submitting && !this.uploading && !this.unloaded && !this.syncState.pendingSubmissions.length && !this.syncState.conflicts.length;
     if (!eligible()) return;
     const local = await this.localHashes();
     if (!isLocalClean(this.syncState, local)) return;
@@ -1106,7 +1152,9 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     try {
       const transport = await this.currentTransport();
       const manifest = await transport.manifest();
-      if (manifest.protocol_version !== PROTOCOL_VERSION) throw new Error("unsupported protocol version");
+      if (manifest.protocol_version !== PROTOCOL_VERSION || !manifest.revision_id) throw new Error("unsupported or invalid manifest");
+      const validatedManifest = validateSyncManifest(manifest);
+      const manifestComplete = validatedManifest.complete;
       const local = await this.localHashes();
       if (pullOnly && !isLocalClean(this.syncState, local)) return;
       const server = /* @__PURE__ */ Object.create(null);
@@ -1130,8 +1178,11 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       }
       const retryExcluded = new Set(this.excludedRetries);
       this.excludedRetries.clear();
-      const decisions = planSync(this.syncState, local, server, {}, {}, blockedPaths, { allowLocalSubmissions: false, retryExcluded });
+      const decisions = planSync(this.syncState, local, server, {}, {}, blockedPaths, { allowLocalSubmissions: false, allowLocalDeletes: manifestComplete, manifestComplete, retryExcluded });
       const reviews = [];
+      let pulled = 0;
+      let deleted = 0;
+      let alreadyCurrent = 0;
       const failures = [];
       for (const decision of decisions) {
         try {
@@ -1139,6 +1190,8 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
             const file = await transport.readFile(decision.path);
             if (validateRelativePath(file.path) !== decision.path) throw new Error("Corrupted file transfer");
             const bytes = base64ToBytes(file.content_base64);
+            const manifestFile = manifest.files.find((entry) => entry.path === decision.path);
+            if (manifestFile && typeof manifestFile.size === "number" && manifestFile.size !== bytes.byteLength) throw new Error("Corrupted file transfer");
             if (await this.hash(bytes.buffer) !== decision.serverHash) throw new Error("Corrupted file transfer");
             if (decision.reason === "server-authoritative-overwrite" && local[decision.path] !== null && local[decision.path] !== void 0) await this.cacheLocalBeforeOverwrite(decision.path, manifest.revision_id, decision.serverHash, local[decision.path]);
             const result = await this.writeFile(decision.path, bytes, "pull", (_b = local[decision.path]) != null ? _b : null);
@@ -1148,6 +1201,14 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
               local[decision.path] = decision.serverHash;
               this.dirtyPaths.delete(decision.path);
               delete this.syncState.excludedFiles[decision.path];
+              if (result.status === "written") pulled++;
+              else alreadyCurrent++;
+            }
+          } else if (decision.kind === "delete-local") {
+            if (await this.cacheLocalBeforeDeletion(decision.path, manifest.revision_id, decision.localHash)) {
+              deleted++;
+              delete local[decision.path];
+              delete this.syncState.files[decision.path];
             }
           } else if (decision.kind === "submit" && !pullOnly) {
             const pending = await this.pendingFor(decision.path, decision.operation, manifest.revision_id);
@@ -1156,8 +1217,10 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
             this.syncState.excludedFiles[decision.path] = { serverHash: decision.serverHash, size: decision.size, reason: "file-too-large" };
             reviews.push(`${decision.path}: ${decision.reason}`);
           } else if (decision.kind === "review") reviews.push(`${decision.path}: ${decision.reason}`);
-          else if (decision.kind === "clean") this.syncState.files[decision.path] = { ...this.syncState.files[decision.path], baseHash: decision.hash, localHash: decision.hash };
-          else if (decision.kind === "conflict") {
+          else if (decision.kind === "clean") {
+            this.syncState.files[decision.path] = { ...this.syncState.files[decision.path], baseHash: decision.hash, localHash: decision.hash };
+            alreadyCurrent++;
+          } else if (decision.kind === "conflict") {
             reviews.push(`${decision.path}: ${(_d = decision.reason) != null ? _d : "manual review required"}`);
             await this.cacheConflict(transport, manifest.revision_id, decision);
           }
@@ -1167,19 +1230,28 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
         }
       }
       for (const file of this.app.vault.getFiles().filter((f) => this.included(f))) {
-        const stat = ((_g = this.app.vault.adapter) == null ? void 0 : _g.stat) ? await this.app.vault.adapter.stat(file.path) : void 0;
-        if (stat && this.syncState.files[file.path]) {
+        let stat;
+        try {
+          stat = ((_g = this.app.vault.adapter) == null ? void 0 : _g.stat) ? await this.app.vault.adapter.stat(file.path) : void 0;
+        } catch (e) {
+          stat = void 0;
+        }
+        if (stat && stat.type !== "folder" && this.syncState.files[file.path]) {
           const knownHash = (_h = local[file.path]) != null ? _h : this.syncState.files[file.path].baseHash;
           this.syncState.files[file.path] = { ...this.syncState.files[file.path], localHash: knownHash, localSize: stat.size, localMtime: stat.mtime };
         }
       }
-      this.localDirty = !isLocalClean(this.syncState, await this.localHashes());
+      try {
+        this.localDirty = !isLocalClean(this.syncState, await this.localHashes());
+      } catch (e) {
+        this.localDirty = true;
+      }
       if (!failures.length) this.syncState.serverRevision = manifest.revision_id;
       await this.saveSync();
       const active = this.app.workspace.getActiveFile();
       const activeConflict = active && this.syncState.conflicts.some((c) => c.path === active.path);
       if (activeConflict) new import_obsidian.Notice("\u5F53\u524D\u7B14\u8BB0\u5B58\u5728\u672A\u89E3\u51B3\u51B2\u7A81\uFF1B\u672C\u5730\u5185\u5BB9\u672A\u88AB\u8986\u76D6\u3002");
-      new import_obsidian.Notice(syncNotice(decisions, reviews, failures, manifest.files.length));
+      new import_obsidian.Notice(syncNotice(decisions, reviews, failures, manifest.files.length, { pulled, deleted, alreadyCurrent }));
     } catch (error) {
       const diagnostic = error == null ? void 0 : error.diagnostic;
       const pairingRequired = (diagnostic == null ? void 0 : diagnostic.reason) === "missing_credentials" || (diagnostic == null ? void 0 : diagnostic.reason) === "credentials_rejected" || this.pairingStatus.kind === "not-paired" && ((_i = this.errors.at(-1)) == null ? void 0 : _i.status) === 401;
@@ -1253,6 +1325,53 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     else this.syncState.overwriteBackups.push(record);
     await this.persistOverwriteBackup(record);
   }
+  async persistDeletionBackup(record) {
+    var _a, _b;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await this.saveSync();
+      let data = null;
+      try {
+        data = await this.loadData();
+      } catch (e) {
+      }
+      const saved = (_b = (_a = data == null ? void 0 : data.sync) == null ? void 0 : _a.deletionBackups) == null ? void 0 : _b.find((item) => item.cachePath === record.cachePath);
+      if (saved && saved.path === record.path && saved.localHash === record.localHash && saved.serverRevisionId === record.serverRevisionId && saved.cacheHash === record.cacheHash && saved.createdAt === record.createdAt) return;
+    }
+    this.storageFailed = true;
+    this.pairingStatus = { kind: "save-failed" };
+    this.updateStatus();
+    const error = localFailure("storage", "persistence_failure");
+    this.recordDiagnostic(error.diagnostic);
+    throw error;
+  }
+  async cacheLocalBeforeDeletion(path, revision, expectedLocalHash) {
+    var _a, _b;
+    const local = this.app.vault.getAbstractFileByPath(path);
+    if (!(local instanceof import_obsidian.TFile)) throw new Error("Local file disappeared before its deletion backup");
+    const bytes = new Uint8Array(await this.app.vault.readBinary(local));
+    const localHash = await this.hash(bytes.buffer);
+    if (localHash !== expectedLocalHash) throw new Error("Local file changed before its deletion backup");
+    const cachePath = `${this.pluginRoot()}/deletions/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
+    const saved = await this.writeFile(cachePath, bytes, "cache");
+    if (saved.status === "conflict") throw new Error((_a = saved.reason) != null ? _a : "Local deletion backup could not be stored safely");
+    const cachedFile = this.app.vault.getAbstractFileByPath(cachePath);
+    if (!(cachedFile instanceof import_obsidian.TFile)) throw new Error("Local deletion backup is not readable");
+    const cachedBytes = new Uint8Array(await this.app.vault.readBinary(cachedFile));
+    const cacheHash = await this.hash(cachedBytes.buffer);
+    if (cacheHash !== localHash) throw new Error("Local deletion backup verification failed");
+    const record = { path, localHash, serverRevisionId: revision, cachePath, cacheHash, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
+    const deletionBackups = (_b = this.syncState.deletionBackups) != null ? _b : this.syncState.deletionBackups = [];
+    const existing = deletionBackups.findIndex((item) => item.cachePath === cachePath);
+    if (existing >= 0) deletionBackups[existing] = record;
+    else deletionBackups.push(record);
+    await this.persistDeletionBackup(record);
+    const current = this.app.vault.getAbstractFileByPath(path);
+    if (!(current instanceof import_obsidian.TFile)) throw new Error("Local file disappeared before deletion");
+    const currentBytes = new Uint8Array(await this.app.vault.readBinary(current));
+    if (await this.hash(currentBytes.buffer) !== localHash) throw new Error("Local file changed; deletion cancelled");
+    await this.app.vault.delete(current);
+    return true;
+  }
   async openOverwriteBackup(record) {
     try {
       const cachedFile = this.app.vault.getAbstractFileByPath(record.cachePath);
@@ -1277,18 +1396,63 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice(`${record.path}: preserved local copy verification failed; ${safeError(error)}.`);
     }
   }
-  /** Explicit user selection is the only path from a local edit to an upload submission. */
+  /** Redirect legacy selection callers through the explicit upload confirmation. */
   async selectLocalChanges(paths) {
-    const unique = [...new Set(paths.map((path) => validateRelativePath(path)))];
-    if (!this.syncState.serverRevision) throw new Error("Sync with server before selecting uploads so the current revision can be submitted safely.");
-    for (const path of unique) {
-      const file = this.app.vault.getAbstractFileByPath(path);
-      if (!(file instanceof import_obsidian.TFile) || !this.included(file)) throw new Error(`${path}: local file is no longer available for upload`);
-      const pending = await this.pendingFor(path, "write", this.syncState.serverRevision);
-      if (pending) this.syncState.pendingSubmissions.push(pending);
+    this.reviewLocalUpload(paths);
+  }
+  uploadConfirmationFor(paths) {
+    var _a;
+    const server = /* @__PURE__ */ Object.create(null);
+    for (const path of Object.keys(this.syncState.files)) {
+      const hash = this.syncState.files[path].baseHash;
+      if (hash) server[path] = { path, sha256: hash, size: (_a = this.syncState.files[path].localSize) != null ? _a : 0 };
     }
-    await this.saveSync();
-    new import_obsidian.Notice(unique.length ? `Selected ${unique.length} local path(s) for upload. Submit pending changes to request server approval.` : "No local paths selected.");
+    return uploadConfirmation(paths, server);
+  }
+  reviewLocalUpload(paths) {
+    const unique = [...new Set(paths.map((path) => validateRelativePath(path)))];
+    if (!unique.length) {
+      new import_obsidian.Notice("No local paths selected.");
+      return;
+    }
+    if (!this.syncState.serverRevision) {
+      new import_obsidian.Notice("Sync with server before uploading so expected server hashes are current.");
+      return;
+    }
+    new UploadConfirmationModal(this.app, this, unique).open();
+  }
+  async uploadSelected(paths) {
+    var _a, _b;
+    const unique = [...new Set(paths.map((path) => validateRelativePath(path)))];
+    if (!unique.length) return void 0;
+    if (!this.syncState.serverRevision) throw new Error("Sync with server before uploading so expected server hashes are current.");
+    if (this.uploading || this.syncing || this.submitting || this.pairing) return void 0;
+    this.uploading = true;
+    this.updateStatus();
+    try {
+      const files = [];
+      for (const path of unique) {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        if (!(file instanceof import_obsidian.TFile) || !this.included(file)) throw new Error(`${path}: local file is no longer available for upload`);
+        const bytes = new Uint8Array(await this.app.vault.readBinary(file));
+        if (bytes.byteLength > MAX_SYNC_FILE_BYTES) throw new Error(`${path}: file is larger than the 16 MiB per-file server limit; it was not uploaded`);
+        const sha256 = await this.hash(bytes.buffer);
+        files.push({ path, contentBase64: bytesToBase64(bytes), sha256, expectedServerSha256: (_b = (_a = this.syncState.files[path]) == null ? void 0 : _a.baseHash) != null ? _b : null });
+      }
+      const result = await (await this.currentTransport()).upload(files);
+      for (const file of files) this.syncState.files[file.path] = { baseHash: file.sha256, localHash: file.sha256, localSize: atob(file.contentBase64).length };
+      if (result.revision_id) this.syncState.serverRevision = result.revision_id;
+      this.localDirty = !isLocalClean(this.syncState, await this.localHashes());
+      await this.saveSync();
+      new import_obsidian.Notice(`Upload complete: ${result.added} added, ${result.overwritten} overwritten. Server revision advanced.`);
+      return result;
+    } catch (error) {
+      new import_obsidian.Notice(`Upload failed: ${safeError(error)}. No local deletion was performed; state was retained.`);
+      throw error;
+    } finally {
+      this.uploading = false;
+      this.updateStatus();
+    }
   }
   async cacheConflict(transport, revision, decision) {
     var _a, _b, _c, _d;
@@ -1583,15 +1747,7 @@ var AuthoritySettingTab = class extends import_obsidian.PluginSettingTab {
         this.display();
       }
     }));
-    status.addButton((b) => b.setButtonText("Submit pending changes").setDisabled(this.plugin.submitting).onClick(async () => {
-      b.setDisabled(true);
-      try {
-        await this.plugin.submitPendingChanges();
-      } finally {
-        b.setDisabled(false);
-        this.display();
-      }
-    }));
+    status.addButton((b) => b.setButtonText("Upload local files").setDisabled(this.plugin.uploading).onClick(() => this.plugin.openLocalUploadPicker()));
     applyActionRowLayout(status.controlEl);
     const common = new import_obsidian.Setting(containerEl).setName("Common actions").setDesc("Use these commands for normal synchronization. Server and pairing settings are under Advanced settings.");
     common.addButton((b) => b.setButtonText("Copy diagnostics").onClick(() => void this.plugin.copyDiagnostics()));
@@ -1601,8 +1757,7 @@ var AuthoritySettingTab = class extends import_obsidian.PluginSettingTab {
       diagnostic.setDesc(this.plugin.diagnosticSummary());
     };
     common.addButton((b) => b.setButtonText("Open conflicts").onClick(() => void this.plugin.openConflicts()));
-    common.addButton((b) => b.setButtonText("Pending submissions").onClick(() => void this.plugin.openPendingSubmissions()));
-    common.addButton((b) => b.setButtonText("Select local uploads").onClick(() => void this.plugin.openLocalUploadPicker()));
+    common.addButton((b) => b.setButtonText("Upload local files").onClick(() => this.plugin.openLocalUploadPicker()));
     for (const path of Object.keys(this.plugin.syncStateForUiExcluded())) common.addButton((b) => b.setButtonText(`Retry excluded ${path}`).onClick(async () => {
       b.setDisabled(true);
       try {
@@ -1753,7 +1908,7 @@ var LocalUploadPickerModal = class extends import_obsidian.Modal {
       this.contentEl.createEl("p", { text: "No local files are available for explicit upload selection." });
       return;
     }
-    this.contentEl.createEl("p", { text: "Select exact paths to create pending uploads. Nothing is submitted until you use Submit pending changes." });
+    this.contentEl.createEl("p", { text: "Select exact paths. Review upload opens a separate confirmation modal; canceling it sends no write request." });
     for (const file of files) new import_obsidian.Setting(this.contentEl).setName(file.path).addButton((button) => button.setButtonText(`Select ${file.path}`).onClick(() => {
       if (selected.has(file.path)) {
         selected.delete(file.path);
@@ -1763,17 +1918,33 @@ var LocalUploadPickerModal = class extends import_obsidian.Modal {
         button.setButtonText(`Selected ${file.path}`);
       }
     }));
-    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("Queue selected uploads").onClick(async () => {
+    new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("Review upload").onClick(() => this.plugin.reviewLocalUpload([...selected])));
+  }
+};
+var UploadConfirmationModal = class extends import_obsidian.Modal {
+  constructor(app, plugin, paths) {
+    super(app);
+    this.plugin = plugin;
+    this.paths = paths;
+  }
+  onOpen() {
+    this.titleEl.setText("Confirm direct upload");
+    this.contentEl.empty();
+    const summary = this.plugin.uploadConfirmationFor(this.paths);
+    this.contentEl.createEl("p", { text: `${summary.additions} added, ${summary.overwrites} overwritten.` });
+    const list = this.contentEl.createEl("ul");
+    for (const path of summary.paths) list.createEl("li", { text: path });
+    const actions = new import_obsidian.Setting(this.contentEl).addButton((button) => button.setButtonText("Cancel").onClick(() => this.close())).addButton((button) => button.setButtonText("Confirm upload").onClick(async () => {
       button.setDisabled(true);
       try {
-        await this.plugin.selectLocalChanges([...selected]);
+        await this.plugin.uploadSelected(this.paths);
         this.close();
-      } catch (error) {
-        new import_obsidian.Notice(safeError(error));
+      } catch (e) {
       } finally {
         button.setDisabled(false);
       }
     }));
+    applyActionRowLayout(actions.controlEl);
   }
 };
 var PendingSubmissionsModal = class extends import_obsidian.Modal {
