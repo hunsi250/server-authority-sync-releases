@@ -149,14 +149,13 @@ function planSync(state, local, server, localKinds = {}, serverKinds = {}, block
   const renameLike = deletedBasePaths.length > 0 && deletedBasePaths.length === localAdded.length && serverAdded.length === 0;
   const blockedPrefixes = [...blocked];
   return [...paths].sort().map((path) => {
-    var _a, _b, _c, _d, _e, _f, _g, _h;
+    var _a, _b, _c, _d, _e, _f;
     if (blockedPrefixes.some((entry) => entry === path || path.startsWith(entry + "/"))) return { kind: "blocked", path, reason: "server-cannot-read" };
     const base = (_b = (_a = state.files[path]) == null ? void 0 : _a.baseHash) != null ? _b : null;
     const localHash = Object.prototype.hasOwnProperty.call(local, path) ? local[path] : null;
     const serverHash = (_d = (_c = server[path]) == null ? void 0 : _c.sha256) != null ? _d : null;
-    if (server[path] && server[path].size > MAX_SYNC_FILE_BYTES && !((_e = options.retryExcluded) == null ? void 0 : _e.has(path))) return { kind: "excluded", path, serverHash: server[path].sha256, size: server[path].size, reason: ((_f = state.excludedFiles[path]) == null ? void 0 : _f.serverHash) === server[path].sha256 ? "file-too-large-cached" : "file-too-large" };
-    const localKind = (_g = localKinds[path]) != null ? _g : localHash !== null ? "file" : void 0;
-    const serverKind = (_h = serverKinds[path]) != null ? _h : serverHash !== null ? "file" : void 0;
+    const localKind = (_e = localKinds[path]) != null ? _e : localHash !== null ? "file" : void 0;
+    const serverKind = (_f = serverKinds[path]) != null ? _f : serverHash !== null ? "file" : void 0;
     const collision = localKind && serverKind && localKind !== serverKind;
     const ancestorCollision = [.../* @__PURE__ */ new Set([...Object.keys(localKinds), ...Object.keys(serverKinds)])].some((parent) => {
       var _a2;
@@ -348,6 +347,7 @@ function applyActionRowLayout(controlEl) {
 var PROTOCOL_VERSION = "1";
 var DEFAULT_API_PREFIX = "/api/v1";
 var CACHE_ROOT = ".obsidian/server-authority-sync";
+var DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 var DEFAULT_SETTINGS = { serverUrl: "", apiPrefix: DEFAULT_API_PREFIX, vaultId: "default", serverFingerprint: "", autoCheckIntervalMinutes: 30, syncPolicy: "server-authoritative", aiProvider: { provider: "", model: "", endpoint: "" } };
 function mergeSettings(input) {
   var _a;
@@ -593,7 +593,8 @@ var RequestUrlTransport = class {
       if (this.enrollment) {
         const vault = `/vaults/${encodeURIComponent(this.settings.vaultId)}`;
         const readPath = body == null ? void 0 : body.path;
-        const operation = path === `${vault}/manifest` ? { type: "manifest" } : path.startsWith(`${vault}/files/`) ? { type: "read-file", path: decodeURIComponent(path.slice(`${vault}/files/`.length)) } : path === `${vault}/read` && typeof readPath === "string" ? { type: "read-file", path: readPath } : path === `${vault}/upload` ? { type: "upload", files: body == null ? void 0 : body.files } : path === "/submissions/list" ? { type: "list-submissions" } : { type: "submit", submission: body };
+        const range = body && typeof body === "object" && typeof body.offset === "number" && typeof body.length === "number" ? { offset: body.offset, length: body.length } : {};
+        const operation = path === `${vault}/manifest` ? { type: "manifest" } : path.startsWith(`${vault}/files/`) ? { type: "read-file", path: decodeURIComponent(path.slice(`${vault}/files/`.length)), ...range } : path === `${vault}/read` && typeof readPath === "string" ? { type: "read-file", path: readPath, ...range } : path === `${vault}/upload` ? { type: "upload", files: body == null ? void 0 : body.files } : path === "/submissions/list" ? { type: "list-submissions" } : { type: "submit", submission: body };
         path = `/enrollments/${encodeURIComponent(this.enrollment.request_id)}/poll`;
         body = { protocol_version: PROTOCOL_VERSION, vault_id: this.settings.vaultId, server_fingerprint: this.settings.serverFingerprint, poll_secret: this.enrollment.poll_secret, operation };
       } else {
@@ -669,8 +670,14 @@ var RequestUrlTransport = class {
   manifest() {
     return this.request("POST", `/vaults/${encodeURIComponent(this.settings.vaultId)}/manifest`, void 0, true);
   }
-  readFile(path) {
-    return this.request("POST", `/vaults/${encodeURIComponent(this.settings.vaultId)}/read`, { path: validateRelativePath(path) }, true);
+  readFile(path, offset, length) {
+    const body = { path: validateRelativePath(path) };
+    if (offset !== void 0 || length !== void 0) {
+      if (!Number.isInteger(offset) || !Number.isInteger(length)) throw new Error("file read range is invalid");
+      body.offset = offset;
+      body.length = length;
+    }
+    return this.request("POST", `/vaults/${encodeURIComponent(this.settings.vaultId)}/read`, body, true);
   }
   upload(files) {
     const encoded = files.map((file) => ({ path: validateRelativePath(file.path), content_base64: file.contentBase64, sha256: file.sha256, expected_server_sha256: file.expectedServerSha256 }));
@@ -709,6 +716,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "session");
     __publicField(this, "enrollment");
     __publicField(this, "syncState", emptySyncState());
+    __publicField(this, "chunkCache", {});
     __publicField(this, "statusBar");
     __publicField(this, "internalWrites", /* @__PURE__ */ new Set());
     __publicField(this, "excludedRetries", /* @__PURE__ */ new Set());
@@ -768,6 +776,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.updateStatus();
   }
   async onload() {
+    var _a;
     let data = null;
     try {
       data = await this.loadData();
@@ -781,6 +790,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.enrollment = enrollmentStructure(data == null ? void 0 : data.enrollment) ? data.enrollment : void 0;
     this.credentialBinding = data == null ? void 0 : data.credentialBinding;
     this.syncState = normalizeSyncState(data == null ? void 0 : data.sync);
+    this.chunkCache = Object.fromEntries(Object.entries((_a = data == null ? void 0 : data.chunkCache) != null ? _a : {}).filter(([, item]) => item && typeof item.path === "string" && typeof item.size === "number" && Number.isInteger(item.size) && item.size > 0 && /^[0-9a-f]{64}$/.test(item.sha256)));
     const state = credentialState(data != null ? data : {}, this.binding());
     this.pairingStatus = this.derivedStatus();
     if (this.storageFailed) {
@@ -921,7 +931,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   persist() {
     const operation = this.writes.catch(() => void 0).then(async () => {
       var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
-      const data = JSON.parse(JSON.stringify({ settings: this.settings, credentialBinding: this.credentialBinding, device_token: this.deviceToken, session: this.session, enrollment: this.enrollment, pairingStatus: this.pairingStatus, sync: this.syncState, errors: this.errors }));
+      const data = JSON.parse(JSON.stringify({ settings: this.settings, credentialBinding: this.credentialBinding, device_token: this.deviceToken, session: this.session, enrollment: this.enrollment, pairingStatus: this.pairingStatus, sync: this.syncState, chunkCache: this.chunkCache, errors: this.errors }));
       const signature = this.credentialSignature();
       const verify = signature !== this.lastVerified && typeof this.loadData === "function";
       for (let attempt = 0; ; attempt++) {
@@ -1047,6 +1057,63 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   async hash(data) {
     const digest = await globalThis.crypto.subtle.digest("SHA-256", data);
     return [...new Uint8Array(digest)].map((x) => x.toString(16).padStart(2, "0")).join("");
+  }
+  async chunkKey(path, serverHash, offset, length) {
+    const pathDigest = await this.hash(new TextEncoder().encode(path).buffer);
+    const key = `${pathDigest}:${serverHash}:${offset}:${length}`;
+    return { key, cachePath: `${CACHE_ROOT}/chunks/${pathDigest}-${serverHash}-${offset}-${length}.bin` };
+  }
+  async cachedChunk(path, serverHash, offset, length) {
+    const { key, cachePath } = await this.chunkKey(path, serverHash, offset, length);
+    const record = this.chunkCache[key];
+    if (!record || record.path !== cachePath || record.size !== length || !/^[0-9a-f]{64}$/.test(record.sha256)) return null;
+    try {
+      const stat = await this.app.vault.adapter.stat(cachePath);
+      if (stat && (stat.type !== "file" || stat.size !== length)) return null;
+      const bytes = new Uint8Array(await this.app.vault.adapter.readBinary(cachePath));
+      if (bytes.byteLength !== length || await this.hash(bytes.buffer) !== record.sha256) return null;
+      return bytes;
+    } catch (e) {
+      return null;
+    }
+  }
+  async cacheChunk(path, serverHash, offset, bytes) {
+    const { key, cachePath } = await this.chunkKey(path, serverHash, offset, bytes.byteLength);
+    const folders = await this.ensureFolder(cachePath);
+    if (!folders.ok) throw new Error(folders.reason);
+    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    await this.app.vault.adapter.writeBinary(cachePath, buffer);
+    const saved = new Uint8Array(await this.app.vault.adapter.readBinary(cachePath));
+    const sha256 = await this.hash(buffer);
+    if (saved.byteLength !== bytes.byteLength || await this.hash(saved.buffer) !== sha256) throw new Error("Chunk cache verification failed");
+    this.chunkCache[key] = { path: cachePath, size: bytes.byteLength, sha256 };
+    await this.persist();
+  }
+  async downloadFile(transport, file) {
+    if (!Number.isSafeInteger(file.size) || file.size < 0) throw new Error("Corrupted manifest file size");
+    const assembled = new Uint8Array(file.size);
+    for (let offset = 0; offset < file.size; offset += DOWNLOAD_CHUNK_BYTES) {
+      const length = Math.min(DOWNLOAD_CHUNK_BYTES, file.size - offset);
+      let chunk = await this.cachedChunk(file.path, file.sha256, offset, length);
+      if (!chunk) {
+        const response = await transport.readFile(file.path, offset, length);
+        if (response.path !== file.path) throw new Error("Corrupted file transfer");
+        chunk = base64ToBytes(response.content_base64);
+        if (response.offset === void 0 && response.length === void 0 && response.sha256 === void 0) {
+          if (offset === 0 && length < file.size && file.size <= MAX_SYNC_FILE_BYTES && chunk.byteLength === file.size) {
+            if (await this.hash(chunk.buffer) !== file.sha256) throw new Error("Corrupted file transfer");
+            return chunk;
+          }
+          if (offset !== 0 || length !== file.size) throw new Error("Corrupted file transfer");
+        } else if (response.offset !== offset || response.length !== length || typeof response.sha256 !== "string" || await this.hash(chunk.buffer) !== response.sha256) throw new Error("Corrupted file transfer");
+        if (chunk.byteLength !== length) throw new Error("Corrupted file transfer");
+        await this.cacheChunk(file.path, file.sha256, offset, chunk);
+      }
+      if (chunk.byteLength !== length) throw new Error("Corrupted cached chunk");
+      assembled.set(chunk, offset);
+    }
+    if (await this.hash(assembled.buffer) !== file.sha256) throw new Error("Corrupted file transfer");
+    return assembled;
   }
   async ensureFolder(path) {
     const parts = path.split("/");
@@ -1187,12 +1254,9 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       for (const decision of decisions) {
         try {
           if (decision.kind === "pull") {
-            const file = await transport.readFile(decision.path);
-            if (validateRelativePath(file.path) !== decision.path) throw new Error("Corrupted file transfer");
-            const bytes = base64ToBytes(file.content_base64);
-            const manifestFile = manifest.files.find((entry) => entry.path === decision.path);
-            if (manifestFile && typeof manifestFile.size === "number" && manifestFile.size !== bytes.byteLength) throw new Error("Corrupted file transfer");
-            if (await this.hash(bytes.buffer) !== decision.serverHash) throw new Error("Corrupted file transfer");
+            const manifestFile = validatedManifest.files.find((entry) => entry.path === decision.path);
+            if (!manifestFile || manifestFile.sha256 !== decision.serverHash) throw new Error("Corrupted manifest");
+            const bytes = await this.downloadFile(transport, manifestFile);
             if (decision.reason === "server-authoritative-overwrite" && local[decision.path] !== null && local[decision.path] !== void 0) await this.cacheLocalBeforeOverwrite(decision.path, manifest.revision_id, decision.serverHash, local[decision.path]);
             const result = await this.writeFile(decision.path, bytes, "pull", (_b = local[decision.path]) != null ? _b : null);
             if (result.status === "conflict") reviews.push(`${decision.path}: ${(_c = result.reason) != null ? _c : "path collision; manual review required"}`);
