@@ -30,6 +30,7 @@ module.exports = __toCommonJS(main_exports);
 
 // src/state.ts
 var SYNC_STATE_VERSION = 1;
+var LOCAL_FAILURE_PHASES = ["download", "cache", "response-validation", "overwrite-backup", "overwrite-index-persistence", "target-write"];
 var SERVER_FINGERPRINT = /^(?:sha256:)?[0-9a-f]{64}$/;
 var PUBLIC_IDENTITY = /^public:[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$/;
 function validateServerFingerprint(value) {
@@ -294,6 +295,7 @@ var SYNC_LOG_ACTIONS = /* @__PURE__ */ new Set(["pull", "delete-local", "review"
 var SYNC_LOG_OUTCOMES = /* @__PURE__ */ new Set(["pulled", "deleted", "review", "blocked", "current", "failed"]);
 var SYNC_LOG_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted", "invalid_response", "vault_unreadable", "internal_error", "request_too_large", "request_format_or_body_too_large", "file_too_large", "upload_rollback_failed", "identity_mismatch", "request_timeout", "server_busy", "local_operation_failed", "missing_credentials", "credentials_rejected", "invalid_binding", "invalid_settings", "persistence_failure"]);
 var SYNC_LOG_REASONS = /* @__PURE__ */ new Set(["server-cannot-read", "not-present-on-server", "server-deletion-retained-locally", "rename-like-delete-review", "file-directory-collision", "incomplete-server-manifest", "server-authoritative-overwrite"]);
+var SYNC_LOG_PHASES = new Set(LOCAL_FAILURE_PHASES);
 function safeSyncPath(path) {
   return typeof path === "string" && path.length > 0 && path.length <= 1024 && !path.startsWith("/") && !path.includes("\\") && !path.split("/").some((part) => !part || part === "." || part === "..");
 }
@@ -303,8 +305,10 @@ function normalizeSyncFailure(value) {
   if (item.status !== void 0 && (!Number.isInteger(item.status) || item.status < 100 || item.status > 599)) return void 0;
   if (item.code !== void 0 && (typeof item.code !== "string" || !SYNC_LOG_CODES.has(item.code))) return void 0;
   if (item.requestId !== void 0 && (typeof item.requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.requestId))) return void 0;
+  if (item.phase !== void 0 && (typeof item.phase !== "string" || !SYNC_LOG_PHASES.has(item.phase))) return void 0;
   if (!Number.isInteger(item.retryCount) || item.retryCount < 0 || item.retryCount > 1e3 || typeof item.retryable !== "boolean") return void 0;
   const result = { retryCount: item.retryCount, retryable: item.retryable };
+  if (item.phase !== void 0) result.phase = item.phase;
   if (item.status !== void 0) result.status = item.status;
   if (item.code !== void 0) result.code = item.code;
   if (item.requestId !== void 0) result.requestId = item.requestId;
@@ -358,6 +362,23 @@ function normalizeSyncRunLogs(value) {
 function appendSyncRunLog(existing, run) {
   const normalized = normalizeSyncRun(run);
   return normalized ? [...normalizeSyncRunLogs(existing), normalized].slice(-MAX_SYNC_RUNS) : normalizeSyncRunLogs(existing);
+}
+function redactedFailure(action, reason, failure) {
+  var _a, _b;
+  const result = { action, retryCount: (_a = failure == null ? void 0 : failure.retryCount) != null ? _a : 0, retryable: (_b = failure == null ? void 0 : failure.retryable) != null ? _b : false };
+  if (typeof reason === "string" && SYNC_LOG_REASONS.has(reason)) result.reason = reason;
+  if (failure == null ? void 0 : failure.phase) result.phase = failure.phase;
+  if ((failure == null ? void 0 : failure.status) !== void 0) result.status = failure.status;
+  if ((failure == null ? void 0 : failure.code) !== void 0) result.code = failure.code;
+  if ((failure == null ? void 0 : failure.requestId) !== void 0) result.requestId = failure.requestId;
+  return result;
+}
+function redactedSyncRunLogs(value) {
+  return normalizeSyncRunLogs(value).map((run) => {
+    const failures = run.paths.filter((path) => path.outcome === "failed" || path.failure).map((path) => redactedFailure(path.action, path.reason, path.failure));
+    if (run.failure) failures.push(redactedFailure("sync", void 0, run.failure));
+    return { runStart: run.runStart, runEnd: run.runEnd, pluginVersion: run.pluginVersion, manifestCount: run.manifest.count, counts: run.counts, failures };
+  });
 }
 function syncNotice(decisions, reviews = [], errors = [], manifestFiles = decisions.length, actual) {
   const outcome = classifySyncOutcome({ decisions, reviews, errors, manifestFiles, actual });
@@ -524,19 +545,21 @@ var LOCAL_REASONS = {
   invalid_response: "The server response could not be parsed. An edge rule, proxy or gateway may have answered instead of the server, or the request was too large. Saved credentials were kept; check Diagnostics.",
   local_operation_failed: "Local sync processing failed. Check vault access and retry."
 };
-function localFailure(stage, reason, requestSent = false) {
-  return Object.assign(new Error(LOCAL_REASONS[reason]), { diagnostic: { stage, reason, retryCount: 0, retryable: false, requestSent } });
+function localFailure(stage, reason, requestSent = false, phase) {
+  return Object.assign(new Error(LOCAL_REASONS[reason]), { diagnostic: { stage, reason, retryCount: 0, retryable: false, requestSent, ...phase ? { phase } : {} } });
 }
 var SAFE_CODES = /* @__PURE__ */ new Set(["invalid_request", "invalid_json", "unsupported_protocol", "unauthorized", "admin_required", "path_collision", "file_collision", "file_directory_collision", "stale_revision", "conflict", "file_not_found", "not_found", "rate_limited", "retryable_server_error", "invalid_submission", "session_expired", "already_submitted", "invalid_response", "vault_unreadable", "internal_error", "request_too_large", "request_format_or_body_too_large", "file_too_large", "upload_rollback_failed", "identity_mismatch", "request_timeout", "server_busy"]);
 var SAFE_DIAGNOSTIC_STAGES = /* @__PURE__ */ new Set(["health", "server-info", "create-enrollment", "poll", "manifest", "file", "upload", "submit", "submissions", "session", "setup", "storage", "load", "settings", "credentials", "sync"]);
+var SAFE_FAILURE_PHASES = new Set(LOCAL_FAILURE_PHASES);
 function normalizeDiagnostics(value) {
   if (!Array.isArray(value)) return [];
   const output = [];
   for (const item of value) {
     if (!item || typeof item !== "object") continue;
     const d = item;
-    if (typeof d.stage !== "string" || !SAFE_DIAGNOSTIC_STAGES.has(d.stage) || d.reason !== void 0 && (typeof d.reason !== "string" || !Object.prototype.hasOwnProperty.call(LOCAL_REASONS, d.reason)) || d.status !== void 0 && (!Number.isInteger(d.status) || d.status < 100 || d.status > 599) || d.code !== void 0 && (typeof d.code !== "string" || !SAFE_CODES.has(d.code)) || d.requestId !== void 0 && (typeof d.requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(d.requestId)) || d.requestSent !== void 0 && typeof d.requestSent !== "boolean" || d.intermediary !== void 0 && typeof d.intermediary !== "boolean" || !Number.isInteger(d.retryCount) || d.retryCount < 0 || d.retryCount > 1e3 || typeof d.retryable !== "boolean") continue;
+    if (typeof d.stage !== "string" || !SAFE_DIAGNOSTIC_STAGES.has(d.stage) || d.phase !== void 0 && (typeof d.phase !== "string" || !SAFE_FAILURE_PHASES.has(d.phase)) || d.reason !== void 0 && (typeof d.reason !== "string" || !Object.prototype.hasOwnProperty.call(LOCAL_REASONS, d.reason)) || d.status !== void 0 && (!Number.isInteger(d.status) || d.status < 100 || d.status > 599) || d.code !== void 0 && (typeof d.code !== "string" || !SAFE_CODES.has(d.code)) || d.requestId !== void 0 && (typeof d.requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(d.requestId)) || d.requestSent !== void 0 && typeof d.requestSent !== "boolean" || d.intermediary !== void 0 && typeof d.intermediary !== "boolean" || !Number.isInteger(d.retryCount) || d.retryCount < 0 || d.retryCount > 1e3 || typeof d.retryable !== "boolean") continue;
     const safe = { stage: d.stage, retryCount: d.retryCount, retryable: d.retryable };
+    if (d.phase !== void 0) safe.phase = d.phase;
     if (d.reason !== void 0) safe.reason = d.reason;
     if (d.status !== void 0) safe.status = d.status;
     if (d.code !== void 0) safe.code = d.code;
@@ -557,7 +580,19 @@ function syncFailureMetadata(error) {
   else if ((diagnostic == null ? void 0 : diagnostic.reason) && Object.prototype.hasOwnProperty.call(LOCAL_REASONS, diagnostic.reason)) metadata.code = diagnostic.reason;
   else metadata.code = "local_operation_failed";
   if ((diagnostic == null ? void 0 : diagnostic.requestId) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(diagnostic.requestId)) metadata.requestId = diagnostic.requestId;
+  if ((diagnostic == null ? void 0 : diagnostic.phase) && SAFE_FAILURE_PHASES.has(diagnostic.phase)) metadata.phase = diagnostic.phase;
   return metadata;
+}
+function phaseFailure(error, phase, defaultReason = "local_operation_failed", requestSent = true) {
+  var _a, _b, _c, _d, _e, _f;
+  const source = error && typeof error === "object" ? error : {};
+  const sourceDiagnostic = source.diagnostic;
+  const reason = (sourceDiagnostic == null ? void 0 : sourceDiagnostic.reason) && Object.prototype.hasOwnProperty.call(LOCAL_REASONS, sourceDiagnostic.reason) ? sourceDiagnostic.reason : defaultReason;
+  const status = Number.isInteger(sourceDiagnostic == null ? void 0 : sourceDiagnostic.status) && ((_a = sourceDiagnostic == null ? void 0 : sourceDiagnostic.status) != null ? _a : 0) >= 100 && ((_b = sourceDiagnostic == null ? void 0 : sourceDiagnostic.status) != null ? _b : 0) <= 599 ? sourceDiagnostic == null ? void 0 : sourceDiagnostic.status : Number.isInteger(source.status) && ((_c = source.status) != null ? _c : 0) >= 100 && ((_d = source.status) != null ? _d : 0) <= 599 ? source.status : void 0;
+  const code = (sourceDiagnostic == null ? void 0 : sourceDiagnostic.code) && SAFE_CODES.has(sourceDiagnostic.code) ? sourceDiagnostic.code : source.code && SAFE_CODES.has(source.code) ? source.code : void 0;
+  const requestId = (sourceDiagnostic == null ? void 0 : sourceDiagnostic.requestId) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sourceDiagnostic.requestId) ? sourceDiagnostic.requestId : void 0;
+  const diagnostic = { stage: (sourceDiagnostic == null ? void 0 : sourceDiagnostic.stage) && SAFE_DIAGNOSTIC_STAGES.has(sourceDiagnostic.stage) ? sourceDiagnostic.stage : "sync", phase, reason, retryCount: (_e = sourceDiagnostic == null ? void 0 : sourceDiagnostic.retryCount) != null ? _e : 0, retryable: (sourceDiagnostic == null ? void 0 : sourceDiagnostic.retryable) === true, ...status === void 0 ? {} : { status }, ...code === void 0 ? {} : { code }, ...requestId === void 0 ? {} : { requestId }, requestSent: (_f = sourceDiagnostic == null ? void 0 : sourceDiagnostic.requestSent) != null ? _f : requestSent, ...(sourceDiagnostic == null ? void 0 : sourceDiagnostic.intermediary) ? { intermediary: true } : {} };
+  return Object.assign(new Error(LOCAL_REASONS[reason]), { status, code, diagnostic, authority: source.authority, intermediary: source.intermediary });
 }
 function requestStage(path) {
   if (path === "/health") return "health";
@@ -640,13 +675,13 @@ var RequestUrlTransport = class {
     }
     this.session = renewed;
   }
-  async request(method, path, body, authenticated = false, retried = false) {
+  async request(method, path, body, authenticated = false, retried = false, phase) {
     var _a, _b, _c, _d;
     const originalPath = path, originalBody = body;
     const stage = requestStage(path);
     const local = (reason) => {
       var _a2;
-      const error = localFailure(stage, reason);
+      const error = localFailure(stage, reason, false, phase);
       (_a2 = this.recordDiagnostic) == null ? void 0 : _a2.call(this, error.diagnostic);
       return error;
     };
@@ -662,7 +697,7 @@ var RequestUrlTransport = class {
       } catch (e) {
       }
       const intermediary = status === 401 && !authenticationRefusal(payload2);
-      const diagnostic = { stage, status, code, requestId, retryCount: retried ? 1 : 0, retryable: status === void 0 || status === 408 || status === 429 || status >= 500, intermediary };
+      const diagnostic = { stage, ...phase ? { phase } : {}, status, code, requestId, retryCount: retried ? 1 : 0, retryable: status === void 0 || status === 408 || status === 429 || status >= 500, intermediary };
       (_c2 = this.recordDiagnostic) == null ? void 0 : _c2.call(this, diagnostic);
       return Object.assign(new Error(message), { status, code, diagnostic, authority: authenticationRefusal(payload2), intermediary });
     };
@@ -717,7 +752,7 @@ var RequestUrlTransport = class {
       }
       if (!retried && this.deviceToken) {
         await this.renewSession();
-        return this.request(method, originalPath, originalBody, authenticated, true);
+        return this.request(method, originalPath, originalBody, authenticated, true, phase);
       }
       this.rejected = true;
       await ((_d = this.unauthorized) == null ? void 0 : _d.call(this));
@@ -758,7 +793,7 @@ var RequestUrlTransport = class {
       body.offset = offset;
       body.length = length;
     }
-    return this.request("POST", `/vaults/${encodeURIComponent(this.settings.vaultId)}/read`, body, true);
+    return this.request("POST", `/vaults/${encodeURIComponent(this.settings.vaultId)}/read`, body, true, false, "download");
   }
   upload(files) {
     const encoded = files.map((file) => ({ path: validateRelativePath(file.path), content_base64: file.contentBase64, sha256: file.sha256, expected_server_sha256: file.expectedServerSha256 }));
@@ -838,7 +873,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   }
   diagnosticsText() {
     var _a, _b;
-    return JSON.stringify({ pluginVersion: (_b = (_a = this.manifest) == null ? void 0 : _a.version) != null ? _b : "unknown", syncRuns: this.syncRuns, errors: this.errors }, null, 2);
+    return JSON.stringify({ pluginVersion: (_b = (_a = this.manifest) == null ? void 0 : _a.version) != null ? _b : "unknown", syncRuns: redactedSyncRunLogs(this.syncRuns), errors: normalizeDiagnostics(this.errors) }, null, 2);
   }
   async copyDiagnostics() {
     try {
@@ -1172,44 +1207,70 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     }
   }
   async cacheChunk(path, serverHash, offset, bytes) {
-    const { key, cachePath } = await this.chunkKey(path, serverHash, offset, bytes.byteLength);
-    const folders = await this.ensureFolder(cachePath);
-    if (!folders.ok) throw new Error(folders.reason);
-    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    await this.app.vault.adapter.writeBinary(cachePath, buffer);
-    const saved = new Uint8Array(await this.app.vault.adapter.readBinary(cachePath));
-    const sha256 = await this.hash(buffer);
-    if (saved.byteLength !== bytes.byteLength || await this.hash(saved.buffer) !== sha256) throw new Error("Chunk cache verification failed");
-    this.chunkCache[key] = { path: cachePath, size: bytes.byteLength, sha256 };
-    await this.persist();
+    try {
+      const { key, cachePath } = await this.chunkKey(path, serverHash, offset, bytes.byteLength);
+      const folders = await this.ensureFolder(cachePath);
+      if (!folders.ok) throw new Error(folders.reason);
+      const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      await this.app.vault.adapter.writeBinary(cachePath, buffer);
+      const saved = new Uint8Array(await this.app.vault.adapter.readBinary(cachePath));
+      const sha256 = await this.hash(buffer);
+      if (saved.byteLength !== bytes.byteLength || await this.hash(saved.buffer) !== sha256) throw new Error("Chunk cache verification failed");
+      this.chunkCache[key] = { path: cachePath, size: bytes.byteLength, sha256 };
+      await this.persist();
+    } catch (error) {
+      const failure = phaseFailure(error, "cache");
+      this.recordDiagnostic(failure.diagnostic);
+      throw failure;
+    }
   }
   async downloadFile(transport, file, metrics) {
-    if (!Number.isSafeInteger(file.size) || file.size < 0) throw new Error("Corrupted manifest file size");
-    const assembled = new Uint8Array(file.size);
-    for (let offset = 0; offset < file.size; offset += DOWNLOAD_CHUNK_BYTES) {
-      const length = Math.min(DOWNLOAD_CHUNK_BYTES, file.size - offset);
-      let chunk = await this.cachedChunk(file.path, file.sha256, offset, length, metrics);
-      if (chunk) metrics && metrics.cacheHits++;
-      if (!chunk) {
-        if (metrics) metrics.rangeRequests++;
-        const response = await transport.readFile(file.path, offset, length);
-        if (response.path !== file.path) throw new Error("Corrupted file transfer");
-        chunk = base64ToBytes(response.content_base64);
-        if (response.offset === void 0 && response.length === void 0 && response.sha256 === void 0) {
-          if (offset === 0 && length < file.size && file.size <= MAX_SYNC_FILE_BYTES && chunk.byteLength === file.size) {
-            if (await this.hash(chunk.buffer) !== file.sha256) throw new Error("Corrupted file transfer");
-            return chunk;
+    var _a;
+    try {
+      if (!Number.isSafeInteger(file.size) || file.size < 0) throw phaseFailure(new Error("invalid manifest size"), "response-validation", "invalid_response", true);
+      const assembled = new Uint8Array(file.size);
+      for (let offset = 0; offset < file.size; offset += DOWNLOAD_CHUNK_BYTES) {
+        const length = Math.min(DOWNLOAD_CHUNK_BYTES, file.size - offset);
+        let chunk = await this.cachedChunk(file.path, file.sha256, offset, length, metrics);
+        const fromCache = !!chunk;
+        if (chunk) metrics && metrics.cacheHits++;
+        if (!chunk) {
+          if (metrics) metrics.rangeRequests++;
+          let response;
+          try {
+            response = await transport.readFile(file.path, offset, length);
+          } catch (error) {
+            throw phaseFailure(error, "download", "local_operation_failed", true);
           }
-          if (offset !== 0 || length !== file.size) throw new Error("Corrupted file transfer");
-        } else if (response.offset !== offset || response.length !== length || typeof response.sha256 !== "string" || await this.hash(chunk.buffer) !== response.sha256) throw new Error("Corrupted file transfer");
-        if (chunk.byteLength !== length) throw new Error("Corrupted file transfer");
-        await this.cacheChunk(file.path, file.sha256, offset, chunk);
+          try {
+            if (response.path !== file.path) throw new Error("invalid file response");
+            chunk = base64ToBytes(response.content_base64);
+            if (response.offset === void 0 && response.length === void 0 && response.sha256 === void 0) {
+              if (offset === 0 && length < file.size && file.size <= MAX_SYNC_FILE_BYTES && chunk.byteLength === file.size) {
+                if (await this.hash(chunk.buffer) !== file.sha256) throw new Error("invalid file hash");
+                return chunk;
+              }
+              if (offset !== 0 || length !== file.size) throw new Error("invalid file range");
+            } else if (response.offset !== offset || response.length !== length || typeof response.sha256 !== "string" || await this.hash(chunk.buffer) !== response.sha256) throw new Error("invalid file range or hash");
+            if (chunk.byteLength !== length) throw new Error("invalid file length");
+          } catch (error) {
+            throw phaseFailure(error, "response-validation", "invalid_response", true);
+          }
+          try {
+            await this.cacheChunk(file.path, file.sha256, offset, chunk);
+          } catch (error) {
+            throw phaseFailure(error, "cache", "local_operation_failed", true);
+          }
+        }
+        if (chunk.byteLength !== length) throw phaseFailure(new Error(fromCache ? "invalid cached chunk" : "invalid file length"), fromCache ? "cache" : "response-validation", "invalid_response", true);
+        assembled.set(chunk, offset);
       }
-      if (chunk.byteLength !== length) throw new Error("Corrupted cached chunk");
-      assembled.set(chunk, offset);
+      if (await this.hash(assembled.buffer) !== file.sha256) throw phaseFailure(new Error("invalid assembled file hash"), "response-validation", "invalid_response", true);
+      return assembled;
+    } catch (error) {
+      if (error && typeof error === "object" && ((_a = error.diagnostic) == null ? void 0 : _a.phase)) throw error;
+      throw phaseFailure(error, "download", "local_operation_failed", true);
     }
-    if (await this.hash(assembled.buffer) !== file.sha256) throw new Error("Corrupted file transfer");
-    return assembled;
   }
   async ensureFolder(path) {
     const parts = path.split("/");
@@ -1253,7 +1314,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.internalWrites.add(path);
     try {
       if (decision.action === "modify" && existing instanceof import_obsidian.TFile) {
-        if (expectedLocalHash !== void 0 && ((_b = this.changeVersions.get(path)) != null ? _b : 0) !== changeVersion) throw new Error("Local file changed during automatic pull");
+        if (expectedLocalHash !== void 0 && ((_b = this.changeVersions.get(path)) != null ? _b : 0) !== changeVersion) throw new Error("local file changed during pull");
         await this.app.vault.modifyBinary(existing, buffer);
       } else {
         try {
@@ -1291,7 +1352,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       return { status: "written" };
     } catch (error) {
       this.internalWrites.delete(path);
-      throw error;
+      throw phaseFailure(error, planner === "cache" ? "cache" : "target-write", "local_operation_failed", true);
     } finally {
       globalThis.setTimeout(() => this.internalWrites.delete(path), 1e3);
     }
@@ -1304,7 +1365,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     if (eligible()) await this.syncWithServer(true);
   }
   async syncWithServer(pullOnly = false) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k;
     if (this.syncing || this.submitting || this.pairing) {
       new import_obsidian.Notice("Sync already in progress.");
       return;
@@ -1330,7 +1391,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     try {
       const transport = await this.currentTransport();
       const manifest = await transport.manifest();
-      if (manifest.protocol_version !== PROTOCOL_VERSION || !manifest.revision_id) throw new Error("unsupported or invalid manifest");
+      if (manifest.protocol_version !== PROTOCOL_VERSION || !manifest.revision_id) throw phaseFailure(new Error("invalid manifest response"), "response-validation", "invalid_response", true);
       const validatedManifest = validateSyncManifest(manifest);
       manifestRevision = manifest.revision_id;
       manifestCount = manifest.files.length;
@@ -1339,8 +1400,13 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       if (pullOnly && !isLocalClean(this.syncState, local)) return;
       const server = /* @__PURE__ */ Object.create(null);
       for (const file of manifest.files) {
-        const path = validateRelativePath(file.path);
-        if (!this.included({ path })) throw new Error("Server manifest contains a protected local path");
+        let path;
+        try {
+          path = validateRelativePath(file.path);
+        } catch (error) {
+          throw phaseFailure(error, "response-validation", "invalid_response", true);
+        }
+        if (!this.included({ path })) throw phaseFailure(new Error("protected manifest path"), "response-validation", "invalid_response", true);
         server[path] = file;
       }
       const blockedPaths = /* @__PURE__ */ new Set();
@@ -1372,14 +1438,27 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
         try {
           if (decision.kind === "pull") {
             const manifestFile = validatedManifest.files.find((entry) => entry.path === decision.path);
-            if (!manifestFile || manifestFile.sha256 !== decision.serverHash) throw new Error("Corrupted manifest");
+            if (!manifestFile || manifestFile.sha256 !== decision.serverHash) throw phaseFailure(new Error("Corrupted manifest"), "response-validation", "invalid_response", true);
             transfer = { rangeRequests: 0, cacheHits: 0, cacheInvalidations: 0 };
             const bytes = await this.downloadFile(transport, manifestFile, transfer);
-            if (decision.reason === "server-authoritative-overwrite" && local[decision.path] !== null && local[decision.path] !== void 0) await this.cacheLocalBeforeOverwrite(decision.path, manifest.revision_id, decision.serverHash, local[decision.path]);
-            const result = await this.writeFile(decision.path, bytes, "pull", (_b = local[decision.path]) != null ? _b : null);
+            if (decision.reason === "server-authoritative-overwrite" && local[decision.path] !== null && local[decision.path] !== void 0) {
+              try {
+                await this.cacheLocalBeforeOverwrite(decision.path, manifest.revision_id, decision.serverHash, local[decision.path]);
+              } catch (error) {
+                if (((_b = error == null ? void 0 : error.diagnostic) == null ? void 0 : _b.phase) === "overwrite-index-persistence") throw error;
+                throw phaseFailure(error, "overwrite-backup", "local_operation_failed", true);
+              }
+            }
+            let result;
+            try {
+              result = await this.writeFile(decision.path, bytes, "pull", (_c = local[decision.path]) != null ? _c : null);
+            } catch (error) {
+              if ((_d = error == null ? void 0 : error.diagnostic) == null ? void 0 : _d.phase) throw error;
+              throw phaseFailure(error, "target-write", "local_operation_failed", true);
+            }
             if (result.status === "conflict") {
               outcome = "review";
-              reviews.push(`${decision.path}: ${(_c = result.reason) != null ? _c : "path collision; manual review required"}`);
+              reviews.push(`${decision.path}: ${(_e = result.reason) != null ? _e : "path collision; manual review required"}`);
             } else {
               this.syncState.files[decision.path] = { baseHash: decision.serverHash, localHash: decision.serverHash };
               local[decision.path] = decision.serverHash;
@@ -1420,13 +1499,13 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
             alreadyCurrent++;
             outcome = "current";
           } else if (decision.kind === "conflict") {
-            reviews.push(`${decision.path}: ${(_d = decision.reason) != null ? _d : "manual review required"}`);
+            reviews.push(`${decision.path}: ${(_f = decision.reason) != null ? _f : "manual review required"}`);
             await this.cacheConflict(transport, manifest.revision_id, decision);
             outcome = "review";
           }
         } catch (error) {
           const diagnostic = error == null ? void 0 : error.diagnostic;
-          failures.push({ path: decision.path, message: safeError(error), status: (_e = diagnostic == null ? void 0 : diagnostic.status) != null ? _e : error == null ? void 0 : error.status, retryable: (_f = diagnostic == null ? void 0 : diagnostic.retryable) != null ? _f : false, diagnostic });
+          failures.push({ path: decision.path, message: safeError(error), status: (_g = diagnostic == null ? void 0 : diagnostic.status) != null ? _g : error == null ? void 0 : error.status, retryable: (_h = diagnostic == null ? void 0 : diagnostic.retryable) != null ? _h : false, diagnostic });
           failure = syncFailureMetadata(error);
           outcome = "failed";
         }
@@ -1445,12 +1524,12 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       for (const file of this.app.vault.getFiles().filter((f) => this.included(f))) {
         let stat;
         try {
-          stat = ((_g = this.app.vault.adapter) == null ? void 0 : _g.stat) ? await this.app.vault.adapter.stat(file.path) : void 0;
+          stat = ((_i = this.app.vault.adapter) == null ? void 0 : _i.stat) ? await this.app.vault.adapter.stat(file.path) : void 0;
         } catch (e) {
           stat = void 0;
         }
         if (stat && stat.type !== "folder" && this.syncState.files[file.path]) {
-          const knownHash = (_h = local[file.path]) != null ? _h : this.syncState.files[file.path].baseHash;
+          const knownHash = (_j = local[file.path]) != null ? _j : this.syncState.files[file.path].baseHash;
           this.syncState.files[file.path] = { ...this.syncState.files[file.path], localHash: knownHash, localSize: stat.size, localMtime: stat.mtime };
         }
       }
@@ -1468,7 +1547,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice(syncNotice(decisions, reviews, failures, manifest.files.length, { pulled, deleted, alreadyCurrent }));
     } catch (error) {
       const diagnostic = error == null ? void 0 : error.diagnostic;
-      const pairingRequired = (diagnostic == null ? void 0 : diagnostic.reason) === "missing_credentials" || (diagnostic == null ? void 0 : diagnostic.reason) === "credentials_rejected" || this.pairingStatus.kind === "not-paired" && ((_i = this.errors.at(-1)) == null ? void 0 : _i.status) === 401;
+      const pairingRequired = (diagnostic == null ? void 0 : diagnostic.reason) === "missing_credentials" || (diagnostic == null ? void 0 : diagnostic.reason) === "credentials_rejected" || this.pairingStatus.kind === "not-paired" && ((_k = this.errors.at(-1)) == null ? void 0 : _k.status) === 401;
       const answered = this.requestsSent > requestsBefore;
       if (this.diagnosticSequence === diagnosticsBefore) {
         const recorded = diagnostic != null ? diagnostic : localFailure("sync", "local_operation_failed", answered).diagnostic;
@@ -1505,7 +1584,18 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   async persistOverwriteBackup(record) {
     var _a, _b;
     for (let attempt = 0; attempt < 2; attempt++) {
-      await this.saveSync();
+      try {
+        await this.saveSync();
+      } catch (error2) {
+        const diagnostic = error2 == null ? void 0 : error2.diagnostic;
+        if (diagnostic) {
+          diagnostic.phase = "overwrite-index-persistence";
+          throw error2;
+        }
+        const failure = phaseFailure(error2, "overwrite-index-persistence", "persistence_failure", true);
+        this.recordDiagnostic(failure.diagnostic);
+        throw failure;
+      }
       let data = null;
       try {
         data = await this.loadData();
@@ -1517,7 +1607,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.storageFailed = true;
     this.pairingStatus = { kind: "save-failed" };
     this.updateStatus();
-    const error = localFailure("storage", "persistence_failure");
+    const error = localFailure("storage", "persistence_failure", true, "overwrite-index-persistence");
     this.recordDiagnostic(error.diagnostic);
     throw error;
   }
