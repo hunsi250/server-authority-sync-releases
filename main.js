@@ -392,8 +392,7 @@ function syncNotice(decisions, reviews = [], errors = [], manifestFiles = decisi
 var import_obsidian = require("obsidian");
 
 // src/ui.ts
-function actionRowLayout(buttonCount) {
-  void buttonCount;
+function actionRowLayout() {
   return {
     display: "flex",
     flexDirection: "column",
@@ -406,7 +405,8 @@ function actionRowLayout(buttonCount) {
   };
 }
 function applyActionRowLayout(controlEl) {
-  const layout = actionRowLayout(controlEl.querySelectorAll("button").length);
+  const buttons = controlEl.querySelectorAll("button");
+  const layout = actionRowLayout();
   controlEl.style.display = layout.display;
   controlEl.style.flexDirection = layout.flexDirection;
   controlEl.style.flexWrap = layout.flexWrap;
@@ -414,7 +414,7 @@ function applyActionRowLayout(controlEl) {
   controlEl.style.width = layout.width;
   controlEl.style.maxWidth = layout.maxWidth;
   controlEl.style.overflowX = layout.overflowX;
-  for (const button of controlEl.querySelectorAll("button")) {
+  for (const button of buttons) {
     button.style.display = layout.button.display;
     button.style.width = layout.button.width;
     button.style.maxWidth = layout.button.maxWidth;
@@ -1297,6 +1297,23 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     }
     return { ok: true };
   }
+  async verifyTargetWrite(path, expectedLength, expectedHash) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) await waitMs(50);
+      try {
+        const indexed = this.app.vault.getAbstractFileByPath(path);
+        if (!(indexed instanceof import_obsidian.TFile)) continue;
+        const stat = await this.app.vault.adapter.stat(path);
+        if (!stat || stat.type !== "file") continue;
+        const readback = await this.app.vault.readBinary(indexed);
+        if (readback.byteLength !== expectedLength) continue;
+        if (await this.hash(readback) !== expectedHash) continue;
+        return;
+      } catch (e) {
+      }
+    }
+    throw new Error("Target write could not be verified");
+  }
   async writeFile(path, bytes, planner = "pull", expectedLocalHash) {
     var _a, _b;
     const changeVersion = (_a = this.changeVersions.get(path)) != null ? _a : 0;
@@ -1335,6 +1352,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
             if (!message.includes("already exists")) throw error;
             try {
               await this.app.vault.createBinary(path, buffer);
+              if (planner === "pull") await this.verifyTargetWrite(path, bytes.byteLength, incomingHash);
               return { status: "written" };
             } catch (retryError) {
               if (!(retryError instanceof Error && retryError.message.toLowerCase().includes("already exists"))) throw retryError;
@@ -1349,6 +1367,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
           throw error;
         }
       }
+      if (planner === "pull") await this.verifyTargetWrite(path, bytes.byteLength, incomingHash);
       return { status: "written" };
     } catch (error) {
       this.internalWrites.delete(path);
@@ -1651,6 +1670,35 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.recordDiagnostic(error.diagnostic);
     throw error;
   }
+  async deleteAndVerify(file, requestSent = true) {
+    const path = file.path;
+    try {
+      await this.app.vault.delete(file);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt) await waitMs(50);
+        let indexed;
+        let stat;
+        let readbackFailed = false;
+        try {
+          indexed = this.app.vault.getAbstractFileByPath(path);
+        } catch (e) {
+          readbackFailed = true;
+        }
+        try {
+          stat = await this.app.vault.adapter.stat(path);
+        } catch (e) {
+          readbackFailed = true;
+        }
+        if (!readbackFailed && !indexed && !stat) return;
+        if (readbackFailed && attempt === 1) throw new Error("File deletion could not be verified");
+      }
+      throw new Error("File deletion could not be verified");
+    } catch (error) {
+      const failure = phaseFailure(error, "target-write", "local_operation_failed", requestSent);
+      this.recordDiagnostic(failure.diagnostic);
+      throw failure;
+    }
+  }
   async cacheLocalBeforeDeletion(path, revision, expectedLocalHash) {
     var _a, _b;
     const local = this.app.vault.getAbstractFileByPath(path);
@@ -1676,7 +1724,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     if (!(current instanceof import_obsidian.TFile)) throw new Error("Local file disappeared before deletion");
     const currentBytes = new Uint8Array(await this.app.vault.readBinary(current));
     if (await this.hash(currentBytes.buffer) !== localHash) throw new Error("Local file changed; deletion cancelled");
-    await this.app.vault.delete(current);
+    await this.deleteAndVerify(current);
     return true;
   }
   async openOverwriteBackup(record) {
@@ -1806,10 +1854,19 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       if (!(local instanceof import_obsidian.TFile)) throw new Error("Local file is already absent");
       const current = new Uint8Array(await this.app.vault.readBinary(local));
       if (await this.hash(current.buffer) !== record.localHash) throw new Error("Local file changed; deletion cancelled");
-      await this.app.vault.delete(local);
+      await this.deleteAndVerify(local, false);
+      const previousBaseline = this.syncState.files[record.path];
+      const previousResolution = record.resolution;
       delete this.syncState.files[record.path];
       record.resolution = "deleted";
-      await this.saveSync();
+      try {
+        await this.saveSync();
+      } catch (error) {
+        if (previousBaseline) this.syncState.files[record.path] = previousBaseline;
+        else delete this.syncState.files[record.path];
+        record.resolution = previousResolution;
+        throw error;
+      }
       new import_obsidian.Notice(`${record.path}: local copy deleted; recovery cache retained.`);
     } catch (error) {
       new import_obsidian.Notice(`${record.path}: deletion cancelled; ${safeError(error)}.`);
