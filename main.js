@@ -842,6 +842,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "statusListener");
     __publicField(this, "changeVersions", /* @__PURE__ */ new Map());
     __publicField(this, "dirtyPaths", /* @__PURE__ */ new Set());
+    __publicField(this, "localPreflight", /* @__PURE__ */ new Map());
     __publicField(this, "storageFailed", false);
     __publicField(this, "requestsSent", 0);
     __publicField(this, "writes", Promise.resolve());
@@ -1157,8 +1158,9 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     return this.included(file);
   }
   async localHashes() {
-    var _a;
+    var _a, _b;
     const result = {};
+    const preflight = /* @__PURE__ */ new Map();
     for (const file of this.app.vault.getFiles().filter((f) => this.included(f))) {
       let stat;
       try {
@@ -1166,12 +1168,30 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       } catch (e) {
         stat = void 0;
       }
+      if (stat && stat.type !== "folder") preflight.set(file.path, { size: stat.size, mtime: stat.mtime, version: (_b = this.changeVersions.get(file.path)) != null ? _b : 0 });
       const cached = this.syncState.files[file.path];
       if (!this.dirtyPaths.has(file.path) && (cached == null ? void 0 : cached.localHash) && stat && stat.type !== "folder" && cached.localSize === stat.size && cached.localMtime === stat.mtime) result[file.path] = cached.localHash;
       else result[file.path] = await this.hash(await this.app.vault.readBinary(file));
       this.dirtyPaths.delete(file.path);
     }
+    this.localPreflight = preflight;
     return result;
+  }
+  /**
+   * A persisted local baseline can be stale without the file being touched: a restore, an archive
+   * extraction or another writer can replace the bytes while keeping size and mtime, so a mismatch
+   * against the cached hash alone does not prove that the file changed during this sync. Only a
+   * vault event or a different stat than the preflight observed proves that; without that proof the
+   * bytes on disk are the authoritative local content, and the recovery copy must be taken from them
+   * instead of failing the path forever (a failed path never refreshes the baseline, so it would
+   * otherwise never be overwritten again).
+   */
+  localChangedSincePreflight(path, current) {
+    var _a;
+    const observed = this.localPreflight.get(path);
+    if (!observed) return true;
+    if (((_a = this.changeVersions.get(path)) != null ? _a : 0) !== observed.version) return true;
+    return observed.size !== current.size || observed.mtime !== current.mtime;
   }
   async hash(data) {
     const digest = await globalThis.crypto.subtle.digest("SHA-256", data);
@@ -1460,17 +1480,19 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
             if (!manifestFile || manifestFile.sha256 !== decision.serverHash) throw phaseFailure(new Error("Corrupted manifest"), "response-validation", "invalid_response", true);
             transfer = { rangeRequests: 0, cacheHits: 0, cacheInvalidations: 0 };
             const bytes = await this.downloadFile(transport, manifestFile, transfer);
-            if (decision.reason === "server-authoritative-overwrite" && local[decision.path] !== null && local[decision.path] !== void 0) {
+            let expectedLocal = (_b = local[decision.path]) != null ? _b : null;
+            if (decision.reason === "server-authoritative-overwrite" && expectedLocal !== null) {
               try {
-                await this.cacheLocalBeforeOverwrite(decision.path, manifest.revision_id, decision.serverHash, local[decision.path]);
+                expectedLocal = (await this.cacheLocalBeforeOverwrite(decision.path, manifest.revision_id, decision.serverHash, expectedLocal)).localHash;
+                local[decision.path] = expectedLocal;
               } catch (error) {
-                if (((_b = error == null ? void 0 : error.diagnostic) == null ? void 0 : _b.phase) === "overwrite-index-persistence") throw error;
+                if (((_c = error == null ? void 0 : error.diagnostic) == null ? void 0 : _c.phase) === "overwrite-index-persistence") throw error;
                 throw phaseFailure(error, "overwrite-backup", "local_operation_failed", true);
               }
             }
             let result;
             try {
-              result = await this.writeFile(decision.path, bytes, "pull", (_c = local[decision.path]) != null ? _c : null);
+              result = await this.writeFile(decision.path, bytes, "pull", expectedLocal);
             } catch (error) {
               if ((_d = error == null ? void 0 : error.diagnostic) == null ? void 0 : _d.phase) throw error;
               throw phaseFailure(error, "target-write", "local_operation_failed", true);
@@ -1631,15 +1653,18 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     throw error;
   }
   async cacheLocalBeforeOverwrite(path, revision, serverHash, expectedLocalHash) {
-    var _a;
+    var _a, _b, _c;
     const local = this.app.vault.getAbstractFileByPath(path);
     if (!(local instanceof import_obsidian.TFile)) throw new Error("Local file disappeared before its overwrite backup");
     const bytes = new Uint8Array(await this.app.vault.readBinary(local));
     const localHash = await this.hash(bytes.buffer);
-    if (localHash !== expectedLocalHash) throw new Error("Local file changed before its overwrite backup");
+    if (localHash !== expectedLocalHash) {
+      const stat = await ((_b = (_a = this.app.vault.adapter) == null ? void 0 : _a.stat) == null ? void 0 : _b.call(_a, path));
+      if (!stat || stat.type !== "file" || stat.size !== bytes.byteLength || this.localChangedSincePreflight(path, { size: stat.size, mtime: stat.mtime })) throw new Error("Local file changed before its overwrite backup");
+    }
     const cachePath = `${this.pluginRoot()}/overwrites/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
     const saved = await this.writeFile(cachePath, bytes, "cache");
-    if (saved.status === "conflict") throw new Error((_a = saved.reason) != null ? _a : "Overwrite backup could not be stored safely");
+    if (saved.status === "conflict") throw new Error((_c = saved.reason) != null ? _c : "Overwrite backup could not be stored safely");
     const cachedFile = this.app.vault.getAbstractFileByPath(cachePath);
     if (!(cachedFile instanceof import_obsidian.TFile)) throw new Error("Overwrite backup is not readable");
     const cachedBytes = new Uint8Array(await this.app.vault.readBinary(cachedFile));
@@ -1650,6 +1675,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     if (existing >= 0) this.syncState.overwriteBackups[existing] = record;
     else this.syncState.overwriteBackups.push(record);
     await this.persistOverwriteBackup(record);
+    return { localHash };
   }
   async persistDeletionBackup(record) {
     var _a, _b;
@@ -1700,22 +1726,25 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     }
   }
   async cacheLocalBeforeDeletion(path, revision, expectedLocalHash) {
-    var _a, _b;
+    var _a, _b, _c, _d;
     const local = this.app.vault.getAbstractFileByPath(path);
     if (!(local instanceof import_obsidian.TFile)) throw new Error("Local file disappeared before its deletion backup");
     const bytes = new Uint8Array(await this.app.vault.readBinary(local));
     const localHash = await this.hash(bytes.buffer);
-    if (localHash !== expectedLocalHash) throw new Error("Local file changed before its deletion backup");
+    if (localHash !== expectedLocalHash) {
+      const stat = await ((_b = (_a = this.app.vault.adapter) == null ? void 0 : _a.stat) == null ? void 0 : _b.call(_a, path));
+      if (!stat || stat.type !== "file" || stat.size !== bytes.byteLength || this.localChangedSincePreflight(path, { size: stat.size, mtime: stat.mtime })) throw new Error("Local file changed before its deletion backup");
+    }
     const cachePath = `${this.pluginRoot()}/deletions/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
     const saved = await this.writeFile(cachePath, bytes, "cache");
-    if (saved.status === "conflict") throw new Error((_a = saved.reason) != null ? _a : "Local deletion backup could not be stored safely");
+    if (saved.status === "conflict") throw new Error((_c = saved.reason) != null ? _c : "Local deletion backup could not be stored safely");
     const cachedFile = this.app.vault.getAbstractFileByPath(cachePath);
     if (!(cachedFile instanceof import_obsidian.TFile)) throw new Error("Local deletion backup is not readable");
     const cachedBytes = new Uint8Array(await this.app.vault.readBinary(cachedFile));
     const cacheHash = await this.hash(cachedBytes.buffer);
     if (cacheHash !== localHash) throw new Error("Local deletion backup verification failed");
     const record = { path, localHash, serverRevisionId: revision, cachePath, cacheHash, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
-    const deletionBackups = (_b = this.syncState.deletionBackups) != null ? _b : this.syncState.deletionBackups = [];
+    const deletionBackups = (_d = this.syncState.deletionBackups) != null ? _d : this.syncState.deletionBackups = [];
     const existing = deletionBackups.findIndex((item) => item.cachePath === cachePath);
     if (existing >= 0) deletionBackups[existing] = record;
     else deletionBackups.push(record);
@@ -1810,11 +1839,12 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     }
   }
   async cacheConflict(transport, revision, decision) {
-    var _a, _b, _c, _d;
+    var _a, _b, _c, _d, _e, _f;
     const existing = this.syncState.conflicts.find((c) => c.path === decision.path && c.serverRevisionId === revision);
     if (existing == null ? void 0 : existing.serverCachePath) return;
     let cachePath = "";
     let cacheHash = null;
+    let reviewLocalHash = null;
     const candidate = `${this.pluginRoot()}/conflicts/${encodeURIComponent(decision.path)}-${encodeURIComponent(revision)}.bin`;
     try {
       let bytes;
@@ -1826,7 +1856,12 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
         const local = this.app.vault.getAbstractFileByPath(decision.path);
         if (!(local instanceof import_obsidian.TFile)) throw new Error("local deletion review has no bytes to cache");
         bytes = new Uint8Array(await this.app.vault.readBinary(local));
-        if (await this.hash(bytes.buffer) !== decision.localHash) throw new Error("Local deletion review changed before backup");
+        const actualHash = await this.hash(bytes.buffer);
+        if (actualHash !== decision.localHash) {
+          const stat = await ((_b = (_a = this.app.vault.adapter) == null ? void 0 : _a.stat) == null ? void 0 : _b.call(_a, decision.path));
+          if (!stat || stat.type !== "file" || stat.size !== bytes.byteLength || this.localChangedSincePreflight(decision.path, { size: stat.size, mtime: stat.mtime })) throw new Error("Local deletion review changed before backup");
+          reviewLocalHash = actualHash;
+        }
       }
       const result = await this.writeFile(candidate, bytes, "cache");
       if (result.status !== "conflict") {
@@ -1836,7 +1871,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     } catch (error) {
       this.recordDiagnostic({ stage: "conflict-cache", code: "invalid_response", retryCount: 0, retryable: true });
     }
-    const record = { conflictId: (_a = existing == null ? void 0 : existing.conflictId) != null ? _a : crypto.randomUUID(), path: decision.path, paths: [decision.path], baseHash: decision.baseHash, localHash: decision.localHash, serverHash: decision.serverHash, serverRevisionId: revision, serverCachePath: cachePath || (existing == null ? void 0 : existing.serverCachePath) || "", cacheHash: (_b = cacheHash != null ? cacheHash : existing == null ? void 0 : existing.cacheHash) != null ? _b : null, createdAt: (_c = existing == null ? void 0 : existing.createdAt) != null ? _c : (/* @__PURE__ */ new Date()).toISOString(), reason: (_d = decision.reason) != null ? _d : "same-path concurrent change", scope: "same-path", resolution: existing == null ? void 0 : existing.resolution };
+    const record = { conflictId: (_c = existing == null ? void 0 : existing.conflictId) != null ? _c : crypto.randomUUID(), path: decision.path, paths: [decision.path], baseHash: decision.baseHash, localHash: reviewLocalHash != null ? reviewLocalHash : decision.localHash, serverHash: decision.serverHash, serverRevisionId: revision, serverCachePath: cachePath || (existing == null ? void 0 : existing.serverCachePath) || "", cacheHash: (_d = cacheHash != null ? cacheHash : existing == null ? void 0 : existing.cacheHash) != null ? _d : null, createdAt: (_e = existing == null ? void 0 : existing.createdAt) != null ? _e : (/* @__PURE__ */ new Date()).toISOString(), reason: (_f = decision.reason) != null ? _f : "same-path concurrent change", scope: "same-path", resolution: existing == null ? void 0 : existing.resolution };
     if (existing) Object.assign(existing, record);
     else this.syncState.conflicts.push(record);
   }
