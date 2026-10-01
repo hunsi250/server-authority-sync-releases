@@ -1660,6 +1660,15 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       return void 0;
     }
   }
+  /**
+   * Private cache entries are named after a digest of the vault path, never after the path itself:
+   * percent-encoding a normal note path (Chinese, Cyrillic, nested folders) produces a filename
+   * component far beyond the 255-byte limit that ext4, APFS and NTFS enforce, so a path-derived name
+   * makes every overwrite and deletion fail at its backup. The record keeps the readable path.
+   */
+  async cacheName(path) {
+    return this.hash(new TextEncoder().encode(path).buffer);
+  }
   async readCacheFile(path) {
     const stat = await this.cacheStat(path);
     if (!stat || stat.type !== "file") return null;
@@ -1711,7 +1720,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       const stat = await ((_b = (_a = this.app.vault.adapter) == null ? void 0 : _a.stat) == null ? void 0 : _b.call(_a, path));
       if (!stat || stat.type !== "file" || stat.size !== bytes.byteLength || this.localChangedSincePreflight(path, { size: stat.size, mtime: stat.mtime })) throw new Error("Local file changed before its overwrite backup");
     }
-    const cachePath = `${this.pluginRoot()}/overwrites/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
+    const cachePath = `${this.pluginRoot()}/overwrites/${await this.cacheName(path)}-${localHash}.bin`;
     const saved = await this.writeCacheFile(cachePath, bytes);
     if (saved.status === "conflict") throw new Error((_c = saved.reason) != null ? _c : "Overwrite backup could not be stored safely");
     const cacheHash = await this.hash(bytes.buffer);
@@ -1781,7 +1790,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       const stat = await ((_b = (_a = this.app.vault.adapter) == null ? void 0 : _a.stat) == null ? void 0 : _b.call(_a, path));
       if (!stat || stat.type !== "file" || stat.size !== bytes.byteLength || this.localChangedSincePreflight(path, { size: stat.size, mtime: stat.mtime })) throw new Error("Local file changed before its deletion backup");
     }
-    const cachePath = `${this.pluginRoot()}/deletions/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
+    const cachePath = `${this.pluginRoot()}/deletions/${await this.cacheName(path)}-${localHash}.bin`;
     const saved = await this.writeCacheFile(cachePath, bytes);
     if (saved.status === "conflict") throw new Error((_c = saved.reason) != null ? _c : "Local deletion backup could not be stored safely");
     const cacheHash = await this.hash(bytes.buffer);
@@ -1887,7 +1896,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     let cachePath = "";
     let cacheHash = null;
     let reviewLocalHash = null;
-    const candidate = `${this.pluginRoot()}/conflicts/${encodeURIComponent(decision.path)}-${encodeURIComponent(revision)}.bin`;
+    const candidate = `${this.pluginRoot()}/conflicts/${await this.cacheName(decision.path)}-${revision}.bin`;
     try {
       let bytes;
       if (decision.serverHash) {
