@@ -1652,6 +1652,55 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
     this.recordDiagnostic(error.diagnostic);
     throw error;
   }
+  async cacheStat(path) {
+    var _a;
+    try {
+      return ((_a = this.app.vault.adapter) == null ? void 0 : _a.stat) ? await this.app.vault.adapter.stat(path) : void 0;
+    } catch (e) {
+      return void 0;
+    }
+  }
+  async readCacheFile(path) {
+    const stat = await this.cacheStat(path);
+    if (!stat || stat.type !== "file") return null;
+    try {
+      return new Uint8Array(await this.app.vault.adapter.readBinary(path));
+    } catch (e) {
+      return null;
+    }
+  }
+  /**
+   * The plugin's private directory lives under the configuration directory, which the host app does
+   * not expose in the Vault index (hidden files are absent from it, which is why the chunk cache
+   * already writes through the DataAdapter). Recovery copies are therefore written and verified
+   * through the adapter as well: requiring the Vault index made every server-authoritative
+   * overwrite, deletion and conflict copy fail with `overwrite-backup`/`cache` on any device whose
+   * configuration directory is not indexed. Writes still verify by read-back before they count.
+   */
+  async writeCacheFile(path, bytes) {
+    const folders = await this.ensureFolder(path);
+    if (!folders.ok) return { status: "conflict", reason: folders.reason };
+    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    const incomingHash = await this.hash(buffer);
+    const existing = await this.cacheStat(path);
+    if (existing && existing.type !== "file") return { status: "conflict", reason: "cache path is not a file" };
+    if (existing) {
+      const current = await this.readCacheFile(path);
+      if (!current || await this.hash(current.buffer) !== incomingHash) return { status: "conflict", reason: "cache path holds different bytes" };
+      return { status: "skipped" };
+    }
+    await this.app.vault.adapter.writeBinary(path, buffer);
+    return { status: "written" };
+  }
+  /** One bounded retry: a transient adapter race must not turn into a permanent path failure. */
+  async verifyCacheFile(path, expectedHash) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) await waitMs(50);
+      const stored = await this.readCacheFile(path);
+      if (stored && await this.hash(stored.buffer) === expectedHash) return true;
+    }
+    return false;
+  }
   async cacheLocalBeforeOverwrite(path, revision, serverHash, expectedLocalHash) {
     var _a, _b, _c;
     const local = this.app.vault.getAbstractFileByPath(path);
@@ -1663,13 +1712,10 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       if (!stat || stat.type !== "file" || stat.size !== bytes.byteLength || this.localChangedSincePreflight(path, { size: stat.size, mtime: stat.mtime })) throw new Error("Local file changed before its overwrite backup");
     }
     const cachePath = `${this.pluginRoot()}/overwrites/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
-    const saved = await this.writeFile(cachePath, bytes, "cache");
+    const saved = await this.writeCacheFile(cachePath, bytes);
     if (saved.status === "conflict") throw new Error((_c = saved.reason) != null ? _c : "Overwrite backup could not be stored safely");
-    const cachedFile = this.app.vault.getAbstractFileByPath(cachePath);
-    if (!(cachedFile instanceof import_obsidian.TFile)) throw new Error("Overwrite backup is not readable");
-    const cachedBytes = new Uint8Array(await this.app.vault.readBinary(cachedFile));
-    const cacheHash = await this.hash(cachedBytes.buffer);
-    if (cacheHash !== localHash) throw new Error("Overwrite backup verification failed");
+    const cacheHash = await this.hash(bytes.buffer);
+    if (!await this.verifyCacheFile(cachePath, cacheHash)) throw new Error("Overwrite backup verification failed");
     const record = { path, localHash, serverHash, serverRevisionId: revision, cachePath, cacheHash, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
     const existing = this.syncState.overwriteBackups.findIndex((item) => item.cachePath === cachePath);
     if (existing >= 0) this.syncState.overwriteBackups[existing] = record;
@@ -1736,13 +1782,10 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       if (!stat || stat.type !== "file" || stat.size !== bytes.byteLength || this.localChangedSincePreflight(path, { size: stat.size, mtime: stat.mtime })) throw new Error("Local file changed before its deletion backup");
     }
     const cachePath = `${this.pluginRoot()}/deletions/${encodeURIComponent(path)}-${encodeURIComponent(revision)}-${localHash}.bin`;
-    const saved = await this.writeFile(cachePath, bytes, "cache");
+    const saved = await this.writeCacheFile(cachePath, bytes);
     if (saved.status === "conflict") throw new Error((_c = saved.reason) != null ? _c : "Local deletion backup could not be stored safely");
-    const cachedFile = this.app.vault.getAbstractFileByPath(cachePath);
-    if (!(cachedFile instanceof import_obsidian.TFile)) throw new Error("Local deletion backup is not readable");
-    const cachedBytes = new Uint8Array(await this.app.vault.readBinary(cachedFile));
-    const cacheHash = await this.hash(cachedBytes.buffer);
-    if (cacheHash !== localHash) throw new Error("Local deletion backup verification failed");
+    const cacheHash = await this.hash(bytes.buffer);
+    if (!await this.verifyCacheFile(cachePath, cacheHash)) throw new Error("Local deletion backup verification failed");
     const record = { path, localHash, serverRevisionId: revision, cachePath, cacheHash, createdAt: (/* @__PURE__ */ new Date()).toISOString() };
     const deletionBackups = (_d = this.syncState.deletionBackups) != null ? _d : this.syncState.deletionBackups = [];
     const existing = deletionBackups.findIndex((item) => item.cachePath === cachePath);
@@ -1758,21 +1801,20 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
   }
   async openOverwriteBackup(record) {
     try {
-      const cachedFile = this.app.vault.getAbstractFileByPath(record.cachePath);
-      if (!(cachedFile instanceof import_obsidian.TFile)) throw new Error("Preserved local copy is missing");
-      const bytes = new Uint8Array(await this.app.vault.readBinary(cachedFile));
+      const bytes = await this.readCacheFile(record.cachePath);
+      if (!bytes) throw new Error("Preserved local copy is missing");
       const hash = await this.hash(bytes.buffer);
       if (hash !== record.cacheHash || hash !== record.localHash) throw new Error("Preserved local copy verification failed");
       await this.app.workspace.openLinkText(record.cachePath, "", false);
+      if (!this.app.vault.getAbstractFileByPath(record.cachePath)) new import_obsidian.Notice(`${record.path}: preserved local copy verified, but this device does not index the plugin's configuration directory, so it cannot be opened in the editor.`, 1e4);
     } catch (error) {
       new import_obsidian.Notice(`${record.path}: preserved local copy could not be opened; ${safeError(error)}.`);
     }
   }
   async verifyOverwriteBackup(record) {
     try {
-      const cachedFile = this.app.vault.getAbstractFileByPath(record.cachePath);
-      if (!(cachedFile instanceof import_obsidian.TFile)) throw new Error("Preserved local copy is missing");
-      const bytes = new Uint8Array(await this.app.vault.readBinary(cachedFile));
+      const bytes = await this.readCacheFile(record.cachePath);
+      if (!bytes) throw new Error("Preserved local copy is missing");
       const hash = await this.hash(bytes.buffer);
       if (hash !== record.cacheHash || hash !== record.localHash) throw new Error("Preserved local copy verification failed");
       new import_obsidian.Notice(`${record.path}: preserved local copy verified.`);
@@ -1863,7 +1905,7 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
           reviewLocalHash = actualHash;
         }
       }
-      const result = await this.writeFile(candidate, bytes, "cache");
+      const result = await this.writeCacheFile(candidate, bytes);
       if (result.status !== "conflict") {
         cachePath = candidate;
         cacheHash = await this.hash(bytes.buffer);
@@ -1882,7 +1924,8 @@ var ServerAuthoritySyncPlugin = class extends import_obsidian.Plugin {
       return;
     }
     try {
-      const cached = new Uint8Array(await this.app.vault.readBinary({ path: record.serverCachePath }));
+      const cached = await this.readCacheFile(record.serverCachePath);
+      if (!cached) throw new Error("Recovery cache is missing");
       const cachedHash = await this.hash(cached.buffer);
       if (cachedHash !== record.localHash || record.cacheHash && cachedHash !== record.cacheHash) throw new Error("Recovery cache verification failed");
       const local = this.app.vault.getAbstractFileByPath(record.path);
